@@ -3121,7 +3121,7 @@ void ConnectionsManager::processRequestQueue(uint32_t connectionTypes, uint32_t 
 
 Datacenter *ConnectionsManager::getDatacenterWithId(uint32_t datacenterId) {
     if (datacenterId == DEFAULT_DATACENTER_ID) {
-        return datacenters[currentDatacenterId];
+        datacenterId = currentDatacenterId;
     }
     auto iter = datacenters.find(datacenterId);
     return iter != datacenters.end() ? iter->second : nullptr;
