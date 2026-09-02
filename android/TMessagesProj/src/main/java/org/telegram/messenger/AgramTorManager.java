@@ -90,7 +90,6 @@ public final class AgramTorManager {
     private volatile int bootstrapProgress;
     private volatile long bootstrapStartedAt;
     private volatile int socksPort;
-    private volatile boolean circuitBuilt;
 
     public static AgramTorManager getInstance() {
         return INSTANCE;
@@ -164,7 +163,6 @@ public final class AgramTorManager {
         bootstrapSummary = "Подготовка Tor";
         bootstrapProgress = 0;
         bootstrapStartedAt = SystemClock.elapsedRealtime();
-        circuitBuilt = false;
         bootstrapPollScheduled = false;
         startScheduled = true;
         final int generation = ++startGeneration;
@@ -387,23 +385,30 @@ public final class AgramTorManager {
                     @Override
                     public void error(String transport, Exception error) {
                         FileLog.e("Agram Tor transport error: " + transport, error);
-                        onTransportFailure(transport, error);
+                        onTransportConnectionIssue(transport, error);
                     }
 
                     @Override
                     public void stopped(String transport, Exception error) {
                         if (error != null) {
-                            FileLog.e("Agram Tor transport stopped: " + transport, error);
-                            onTransportFailure(transport, error);
+                            // For obfs4/webtunnel IPtProxy reports Stopped for one
+                            // failed SOCKS connection, not for the shared listener.
+                            // Tor must remain alive so it can try the next bridge.
+                            FileLog.e("Agram Tor transport connection failed: " + transport, error);
+                            onTransportConnectionIssue(transport, error);
                         }
                     }
                 });
     }
 
-    private void onTransportFailure(String transport, Throwable error) {
+    private void onTransportConnectionIssue(String transport, Throwable error) {
         synchronized (this) {
+            if (STATE_STOPPED.equals(state) || STATE_ERROR.equals(state)) {
+                return;
+            }
             lastError = transport + ": " + safeError(error);
-            updateState(STATE_ERROR, 0);
+            notifyListeners();
+            scheduleBootstrapPoll(startGeneration, 0);
         }
     }
 
@@ -468,7 +473,10 @@ public final class AgramTorManager {
                 return;
             }
         }
-        if (port > 0 && port <= 65535 && (circuitBuilt || bootstrapProgress >= 100)) {
+        // STATUS_ON means that TorService is running, not that Tor has built a
+        // usable circuit. Only the control-port bootstrap phase may mark the
+        // route ready; otherwise a bridge timeout can be shown as a false 100%.
+        if (port > 0 && port <= 65535 && bootstrapProgress >= 100) {
             lastError = "";
             bootstrapProgress = 100;
             bootstrapSummary = "Tor подключён";
@@ -476,8 +484,11 @@ public final class AgramTorManager {
             return;
         }
         if (SystemClock.elapsedRealtime() - startedAt >= BOOTSTRAP_TIMEOUT_MS) {
+            String transportError = lastError;
             failStart(generation,
-                    "Tor не подключился за 120 секунд. Проверьте сеть или замените мост.");
+                    "Tor не подключился за 120 секунд. Проверьте сеть или замените мост."
+                            + (TextUtils.isEmpty(transportError) ? ""
+                            : " Последняя ошибка транспорта: " + transportError));
             return;
         }
         scheduleBootstrapPoll(generation, BOOTSTRAP_POLL_MS);
@@ -555,7 +566,6 @@ public final class AgramTorManager {
         bootstrapSummary = "";
         bootstrapProgress = 0;
         bootstrapStartedAt = 0;
-        circuitBuilt = false;
         socksPort = 0;
         stopTransports();
     }
@@ -636,7 +646,6 @@ public final class AgramTorManager {
             }
             String status = intent.getStringExtra(TorService.EXTRA_STATUS);
             if (TorService.STATUS_ON.equals(status)) {
-                circuitBuilt = true;
                 scheduleBootstrapPoll(startGeneration, 0);
             } else if (TorService.STATUS_STARTING.equals(status)) {
                 updateState(STATE_STARTING, 0);

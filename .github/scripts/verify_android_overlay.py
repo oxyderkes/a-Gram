@@ -86,6 +86,14 @@ if ".append(endpoint).append(':').append(port)" in tor_manager or ".append(addre
     errors.append("IPtProxy localAddress already includes its port and must not be suffixed again")
 if '.append(" socks5 ").append(endpoint).append(\'\\n\')' not in tor_manager:
     errors.append("pluggable transport endpoint must be written as the complete IPtProxy host:port value")
+if "circuitBuilt || bootstrapProgress >= 100" in tor_manager or "circuitBuilt = true" in tor_manager:
+    errors.append("TorService STATUS_ON must not be treated as completed Tor bootstrap")
+if "port > 0 && port <= 65535 && bootstrapProgress >= 100" not in tor_manager:
+    errors.append("Tor readiness must require a real 100 percent control-port bootstrap phase")
+if "onTransportFailure" in tor_manager or "onTransportConnectionIssue" not in tor_manager:
+    errors.append("individual pluggable-transport connection failures must remain retryable")
+if "Tor must remain alive so it can try the next bridge" not in tor_manager:
+    errors.append("bridge failover guard is missing")
 
 if "ensureUniquePushInstanceLocked" not in container_manager:
     errors.append("legacy duplicate push instances are not repaired")
