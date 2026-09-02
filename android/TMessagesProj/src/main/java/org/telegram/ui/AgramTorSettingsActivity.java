@@ -20,7 +20,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import org.telegram.messenger.AgramContainerManager;
+import org.telegram.messenger.AgramBridgeRequestClient;
 import org.telegram.messenger.AgramNetworkController;
+import org.telegram.messenger.AgramRdsysBridgeClient;
 import org.telegram.messenger.AgramSessionRouteController;
 import org.telegram.messenger.AgramTorManager;
 import org.telegram.messenger.AndroidUtilities;
@@ -36,6 +38,7 @@ import org.telegram.ui.Components.LayoutHelper;
 public class AgramTorSettingsActivity extends BaseFragment
         implements AgramTorManager.Listener, AgramSessionRouteController.Listener {
     private final int account;
+    private final AgramBridgeRequestClient bridgeRequestClient;
     private AgramContainerManager.ContainerRecord record;
     private TextView stateView;
     private TextView routeView;
@@ -44,6 +47,7 @@ public class AgramTorSettingsActivity extends BaseFragment
     private ProgressBar bootstrapProgress;
     private Switch bridgesEnabled;
     private EditText bridgeLines;
+    private TextView bridgeAssistStatus;
 
     private final Runnable statusTicker = new Runnable() {
         @Override
@@ -57,11 +61,17 @@ public class AgramTorSettingsActivity extends BaseFragment
     };
 
     public AgramTorSettingsActivity() {
-        this(UserConfig.selectedAccount);
+        this(UserConfig.selectedAccount, new AgramRdsysBridgeClient());
     }
 
     public AgramTorSettingsActivity(int account) {
+        this(account, new AgramRdsysBridgeClient());
+    }
+
+    /** Allows the bridge request backend to be supplied without coupling it to Tor lifecycle code. */
+    public AgramTorSettingsActivity(int account, AgramBridgeRequestClient bridgeRequestClient) {
         this.account = account;
+        this.bridgeRequestClient = bridgeRequestClient;
         currentAccount = account;
     }
 
@@ -180,6 +190,15 @@ public class AgramTorSettingsActivity extends BaseFragment
         bridgeCard.addView(body(context,
                 "Строки мостов зашифрованы Android Keystore. Сам Tor общий для экономии памяти, поэтому изменение мостов и его перезапуск временно приостановят все Tor-контейнеры."),
                 LayoutHelper.createLinear(-1, -2, 0, 8, 0, 0));
+        bridgeAssistStatus = body(context, "");
+        bridgeAssistStatus.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        bridgeCard.addView(bridgeAssistStatus,
+                LayoutHelper.createLinear(-1, -2, 0, 10, 0, 0));
+        TextView requestBridges = action(context, "CONNECTION ASSIST · ЗАПРОСИТЬ МОСТЫ");
+        requestBridges.setContentDescription("Connection Assist, запросить мосты Tor");
+        requestBridges.setOnClickListener(v -> presentFragment(new AgramBridgeRequestActivity(
+                bridgeRequestClient, this::applyRequestedBridges)));
+        bridgeCard.addView(requestBridges, LayoutHelper.createLinear(-1, 46, 0, 8, 0, 0));
         TextView saveBridges = action(context, "СОХРАНИТЬ МОСТЫ И ПЕРЕЗАПУСТИТЬ");
         saveBridges.setOnClickListener(v -> saveBridges());
         bridgeCard.addView(saveBridges, LayoutHelper.createLinear(-1, 46, 0, 10, 0, 0));
@@ -221,6 +240,14 @@ public class AgramTorSettingsActivity extends BaseFragment
         }
     }
 
+    private void applyRequestedBridges(boolean enabled, String lines) {
+        AgramTorManager.getInstance().saveBridgeConfig(enabled, lines);
+        bridgesEnabled.setChecked(enabled);
+        bridgeLines.setText(lines);
+        AgramTorManager.getInstance().restart();
+        updateState();
+    }
+
     private void updateState() {
         if (stateView == null) {
             return;
@@ -260,6 +287,28 @@ public class AgramTorSettingsActivity extends BaseFragment
         boolean circuitReady = usesTor && AgramTorManager.STATE_READY.equals(torState);
         circuitAction.setEnabled(circuitReady);
         circuitAction.setAlpha(circuitReady ? 1f : .45f);
+
+        AgramTorManager.BridgeConfig bridgeConfig = tor.getBridgeConfig();
+        int bridgeCount = countBridgeLines(bridgeConfig.lines);
+        String configured = bridgeConfig.enabled
+                ? "Мосты включены" + (bridgeCount > 0 ? " · строк: " + bridgeCount : "")
+                : "Мосты выключены";
+        bridgeAssistStatus.setText("Connection Assist: "
+                + (bridgeRequestClient == null ? "сервис не подключён" : "готов к запросу")
+                + "\n" + configured);
+    }
+
+    private static int countBridgeLines(String lines) {
+        if (TextUtils.isEmpty(lines)) {
+            return 0;
+        }
+        int count = 0;
+        for (String line : lines.split("\\r?\\n")) {
+            if (!TextUtils.isEmpty(line.trim())) {
+                count++;
+            }
+        }
+        return count;
     }
 
     @Override

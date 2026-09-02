@@ -26,9 +26,12 @@ secure_store = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramSec
 push_controller = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramPushController.java")
 network_controller = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramNetworkController.java")
 tor_manager = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramTorManager.java")
+tor_bridge_pool = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramTorBridgePool.java")
+rdsys_client = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramRdsysBridgeClient.java")
 session_route = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramSessionRouteController.java")
 container_setup = read("TMessagesProj/src/main/java/org/telegram/ui/AgramContainerSetupActivity.java")
 dialogs_activity = read("TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java")
+bridge_request_activity = read("TMessagesProj/src/main/java/org/telegram/ui/AgramBridgeRequestActivity.java")
 messages_controller = read("TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java")
 stories_controller = read("TMessagesProj/src/main/java/org/telegram/ui/Stories/StoriesController.java")
 chat_activity = read("TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java")
@@ -87,7 +90,7 @@ if "SocksPort 127.0.0.1:auto" in tor_manager:
     errors.append("invalid address:auto SocksPort syntax returned")
 if 'SocksPort auto IsolateSOCKSAuth' not in tor_manager:
     errors.append("embedded Tor must request an automatic isolated SOCKS listener")
-if "transportController.localAddress(transport)" not in tor_manager:
+if not re.search(r"\b(?:transportController|controller)\.localAddress\(transport\)", tor_manager):
     errors.append("pluggable transport endpoint discovery is missing")
 if ".append(endpoint).append(':').append(port)" in tor_manager or ".append(address).append(':').append(port)" in tor_manager:
     errors.append("IPtProxy localAddress already includes its port and must not be suffixed again")
@@ -105,6 +108,29 @@ if "agramRouteItem" in dialogs_activity or "100% · подключено" in dia
     errors.append("removed Tor status pill returned to the dialogs header")
 if "agramNetworkItem" not in dialogs_activity or "AgramTorSettingsActivity(currentAccount)" not in dialogs_activity:
     errors.append("Tor/proxy settings icon is missing from the dialogs header")
+
+required_connection_assist_guards = (
+    (rdsys_client, 'API_ORIGIN = "https://bridges.torproject.org"'),
+    (rdsys_client, "TOR_BRIDGES_SPKI_SHA256"),
+    (rdsys_client, "new ArrayBlockingQueue<>(8)"),
+    (rdsys_client, "AgramTorBridgePool.builtInSnowflakeLine()"),
+    (tor_bridge_pool, "BUILT_IN_SNOWFLAKE_LINE"),
+    (tor_bridge_pool, "recordOutcome"),
+    (tor_manager, "bridgeAttemptIndex + 1 < bridgePlan.size()"),
+    (bridge_request_activity, "MAX_CAPTCHA_PIXELS"),
+    (bridge_request_activity, "Telegram этот запрос не получает"),
+)
+for source, guard in required_connection_assist_guards:
+    if guard not in source:
+        errors.append(f"Connection Assist security guard is missing: {guard}")
+
+connect_index = rdsys_client.find("connection.connect();")
+pin_index = rdsys_client.find("verifyPin(connection);", connect_index)
+output_index = rdsys_client.find("connection.getOutputStream()", pin_index)
+if not (0 <= connect_index < pin_index < output_index):
+    errors.append("rdsys TLS pin must be verified before writing a POST body")
+if "catch (Throwable error)" in rdsys_client:
+    errors.append("rdsys client must not catch fatal VM errors or double-notify callbacks")
 
 if "ensureUniquePushInstanceLocked" not in container_manager:
     errors.append("legacy duplicate push instances are not repaired")
