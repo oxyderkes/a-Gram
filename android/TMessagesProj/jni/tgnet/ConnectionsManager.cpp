@@ -408,19 +408,25 @@ void ConnectionsManager::loadConfig() {
         buffer->reuse();
     }
 
-    if (currentDatacenterId != 0 && currentUserId) {
-        Datacenter *datacenter = getDatacenterWithId(currentDatacenterId);
-        if (datacenter == nullptr || !datacenter->hasPermanentAuthKey()) {
-            if (datacenter != nullptr) {
-                if (LOGS_ENABLED) DEBUG_D("reset authorization because of dc %d", currentDatacenterId);
+    if (currentUserId != 0) {
+        Datacenter *datacenter = currentDatacenterId != 0 ? getDatacenterWithId(currentDatacenterId) : nullptr;
+        if (currentDatacenterId == 0 || datacenter == nullptr || !datacenter->hasPermanentAuthKey()) {
+            localAuthConfigQuarantined = true;
+            networkAvailable = false;
+            connectionState = ConnectionStateWaitingForNetwork;
+            if (LOGS_ENABLED) {
+                DEBUG_E("quarantine account%u: local config/auth key mismatch (dc=%u, present=%d, hasAuthKey=%d)",
+                        instanceNum,
+                        currentDatacenterId,
+                        datacenter != nullptr,
+                        datacenter != nullptr && datacenter->hasPermanentAuthKey());
             }
-            currentDatacenterId = 0;
-            datacenters.clear();
             scheduleTask([&] {
                 if (delegate != nullptr) {
-                    delegate->onLogout(instanceNum);
+                    delegate->onLogout(instanceNum, LogoutReasonLocalConfigMismatch);
                 }
             });
+            return;
         }
     }
 
@@ -470,6 +476,10 @@ void ConnectionsManager::saveConfigInternal(NativeByteBuffer *buffer) {
 }
 
 void ConnectionsManager::saveConfig() {
+    if (localAuthConfigQuarantined) {
+        if (LOGS_ENABLED) DEBUG_E("skip config write for quarantined account%u", instanceNum);
+        return;
+    }
     if (config == nullptr) {
         config = new Config(instanceNum, "tgnet.dat");
     }
@@ -672,6 +682,7 @@ void ConnectionsManager::cleanUp(bool resetKeys, int32_t datacenterId) {
         if (datacenterId == -1) {
             sessionsToDestroy.clear();
             currentUserId = 0;
+            localAuthConfigQuarantined = false;
             currentUserPremium = false;
             registeredForInternalPush = false;
         }
@@ -1417,7 +1428,7 @@ void ConnectionsManager::processServerResponse(TLObject *message, int64_t messag
                                 } else if (error->error_message.find(bindFailed) != std::string::npos && typeid(*request->rawRequest) == typeid(TL_auth_bindTempAuthKey)) {
                                     int datacenterId;
                                     if (delegate != nullptr && getDatacenterWithId(DEFAULT_DATACENTER_ID) == datacenter) {
-                                        delegate->onLogout(instanceNum);
+                                        delegate->onLogout(instanceNum, LogoutReasonServerAuthRejected);
                                         datacenterId = -1;
                                     } else {
                                         datacenterId = datacenter->getDatacenterId();
@@ -1496,7 +1507,7 @@ void ConnectionsManager::processServerResponse(TLObject *message, int64_t messag
                                     currentUserId = 0;
                                     currentUserPremium = false;
                                     if (delegate != nullptr) {
-                                        delegate->onLogout(instanceNum);
+                                        delegate->onLogout(instanceNum, LogoutReasonServerAuthRejected);
                                     }
                                     cleanUp(false, -1);
                                 }
@@ -3677,7 +3688,7 @@ void ConnectionsManager::init(uint32_t version, int32_t layer, int32_t apiId, st
     loadConfig();
 
     bool needLoadConfig = false;
-    if (systemLangCode.compare(lastInitSystemLangcode) != 0) {
+    if (!localAuthConfigQuarantined && systemLangCode.compare(lastInitSystemLangcode) != 0) {
         lastInitSystemLangcode = systemLangCode;
         for (auto & datacenter : datacenters) {
             datacenter.second->resetInitVersion();
@@ -3685,7 +3696,7 @@ void ConnectionsManager::init(uint32_t version, int32_t layer, int32_t apiId, st
         needLoadConfig = true;
         saveConfig();
     }
-    if (!needLoadConfig && currentUserId != 0) {
+    if (!localAuthConfigQuarantined && !needLoadConfig && currentUserId != 0) {
         Datacenter *datacenter = getDatacenterWithId(DEFAULT_DATACENTER_ID);
         if (datacenter != nullptr && datacenter->lastInitVersion != currentVersion) {
             needLoadConfig = true;
@@ -3694,7 +3705,7 @@ void ConnectionsManager::init(uint32_t version, int32_t layer, int32_t apiId, st
 
     pthread_create(&networkThread, nullptr, (ConnectionsManager::ThreadProc), this);
 
-    if (needLoadConfig) {
+    if (!localAuthConfigQuarantined && needLoadConfig) {
         updateDcSettings(0, false, false);
     }
 }
@@ -3806,6 +3817,10 @@ void ConnectionsManager::setSessionProfile(std::string deviceModel, std::string 
 
 void ConnectionsManager::resumeNetwork(bool partial) {
     scheduleTask([&, partial] {
+        if (localAuthConfigQuarantined) {
+            if (LOGS_ENABLED) DEBUG_E("ignore network resume for quarantined account%u", instanceNum);
+            return;
+        }
         if (lastMonotonicPauseTime != 0) {
             int64_t diff = (getCurrentTimeMonotonicMillis() - lastMonotonicPauseTime) / 1000;
             int64_t systemDiff = getCurrentTime() - lastSystemPauseTime;
@@ -3855,6 +3870,14 @@ void ConnectionsManager::pauseNetwork() {
 
 void ConnectionsManager::setNetworkAvailable(bool value, int32_t type, bool slow) {
     scheduleTask([&, value, type, slow] {
+        if (localAuthConfigQuarantined) {
+            networkAvailable = false;
+            connectionState = ConnectionStateWaitingForNetwork;
+            if (delegate != nullptr) {
+                delegate->onConnectionStateChanged(connectionState, instanceNum);
+            }
+            return;
+        }
         networkAvailable = value;
         currentNetworkType = type;
         networkSlow = slow;

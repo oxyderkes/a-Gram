@@ -30,6 +30,8 @@ public class UserConfig extends BaseController {
     public static final int ACCOUNT_STATE_FROZEN = 2;
     public static final int ACCOUNT_STATE_BLOCKED = 3;
     private static final String ACCOUNT_STATE_PREFERENCES = "agram_account_states";
+    private static final String ACCOUNT_SELECTION_PREFERENCES = "agram_account_selection";
+    private static final String SELECTED_ACCOUNT_KEY = "selected_account";
     private static final String ENCRYPTED_ACCOUNT_CARD_PREFIX = "v1:";
     /**
      * Number of local account slots supported by this fork.
@@ -145,6 +147,54 @@ public class UserConfig extends BaseController {
         return empty;
     }
 
+    /**
+     * The selected engine slot is process-global state, not account-0 state.
+     * Persist it synchronously in a dedicated registry so clearing account 0
+     * or killing the process for an APK update cannot roll the pointer back.
+     */
+    public static void setSelectedAccountPersisted(int account) {
+        if (account < 0 || account >= MAX_ACCOUNT_COUNT) {
+            throw new IllegalArgumentException("Invalid account slot " + account);
+        }
+        synchronized (UserConfig.class) {
+            selectedAccount = account;
+            getAccountSelectionPreferences().edit()
+                    .putInt(SELECTED_ACCOUNT_KEY, account)
+                    .commit();
+        }
+    }
+
+    /** Repairs a stale slot pointer after every cold start. */
+    public static int reconcileSelectedAccount() {
+        int account = selectedAccount;
+        if (account >= 0 && account < MAX_ACCOUNT_COUNT && getInstance(account).isClientActivated()) {
+            setSelectedAccountPersisted(account);
+            return account;
+        }
+        for (int a = 0; a < MAX_ACCOUNT_COUNT; a++) {
+            if (getInstance(a).isClientActivated()) {
+                setSelectedAccountPersisted(a);
+                return a;
+            }
+        }
+        account = getLoginTargetAccount();
+        setSelectedAccountPersisted(account);
+        return account;
+    }
+
+    /** Returns the canonical lowest free slot for an explicit new login. */
+    public static int getLoginTargetAccount() {
+        int account = getAvailableAccountSlot();
+        if (account >= 0) {
+            return account;
+        }
+        return selectedAccount >= 0 && selectedAccount < MAX_ACCOUNT_COUNT ? selectedAccount : 0;
+    }
+
+    private static SharedPreferences getAccountSelectionPreferences() {
+        return ApplicationLoader.applicationContext.getSharedPreferences(ACCOUNT_SELECTION_PREFERENCES, Context.MODE_PRIVATE);
+    }
+
     public UserConfig(int instance) {
         super(instance);
     }
@@ -179,9 +229,6 @@ public class UserConfig extends BaseController {
             synchronized (sync) {
                 try {
                     SharedPreferences.Editor editor = getPreferences().edit();
-                    if (currentAccount == 0) {
-                        editor.putInt("selectedAccount", selectedAccount);
-                    }
                     editor.putBoolean("registeredForPush", registeredForPush);
                     editor.putInt("lastSendMessageId", lastSendMessageId);
                     editor.putInt("contactsSavedCount", contactsSavedCount);
@@ -516,7 +563,16 @@ public class UserConfig extends BaseController {
             }
             SharedPreferences preferences = getPreferences();
             if (currentAccount == 0) {
-                selectedAccount = preferences.getInt("selectedAccount", 0);
+                SharedPreferences accountSelection = getAccountSelectionPreferences();
+                int legacySelectedAccount = preferences.getInt("selectedAccount", 0);
+                int storedSelectedAccount = accountSelection.getInt(SELECTED_ACCOUNT_KEY, legacySelectedAccount);
+                if (storedSelectedAccount < 0 || storedSelectedAccount >= MAX_ACCOUNT_COUNT) {
+                    storedSelectedAccount = 0;
+                }
+                selectedAccount = storedSelectedAccount;
+                if (!accountSelection.contains(SELECTED_ACCOUNT_KEY)) {
+                    accountSelection.edit().putInt(SELECTED_ACCOUNT_KEY, storedSelectedAccount).commit();
+                }
             }
             registeredForPush = preferences.getBoolean("registeredForPush", false);
             lastSendMessageId = preferences.getInt("lastSendMessageId", -210000);

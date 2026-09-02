@@ -1279,8 +1279,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             ApplicationLoader.ensureAccountInitialized(account);
 
             ConnectionsManager.getInstance(currentAccount).setAppPaused(true, false);
-            UserConfig.selectedAccount = account;
-            UserConfig.getInstance(0).saveConfig(false);
+            UserConfig.setSelectedAccountPersisted(account);
             AgramContainerManager.getInstance().publishProxyForSelectedContainer(account);
             AgramNetworkController.getInstance().apply(account);
 
@@ -1335,6 +1334,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         if (account != -1) {
             switchToAccount(account, true);
         } else {
+            int loginAccount = UserConfig.getLoginTargetAccount();
+            UserConfig.setSelectedAccountPersisted(loginAccount);
+            currentAccount = loginAccount;
             RestrictedLanguagesSelectActivity.checkRestrictedLanguages(true);
             clearFragments();
             actionBarLayout.rebuildLogout();

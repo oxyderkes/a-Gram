@@ -240,6 +240,7 @@ private:
     std::string currentConfigPath;
     std::string currentLogPath;
     int64_t currentUserId = 0;
+    bool localAuthConfigQuarantined = false;
     bool currentUserPremium = false;
     bool registeredForInternalPush = false;
     bool pushConnectionEnabled = true;

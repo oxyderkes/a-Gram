@@ -349,10 +349,11 @@ public class ApplicationLoader extends Application {
         for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
             UserConfig.getInstance(a).loadConfig();
         }
+        int startupAccount = UserConfig.reconcileSelectedAccount();
         // Never infer a logout during cold start: Telegram may still be
         // restoring a session. Confirmed logout paths delete their container.
-        ensureAccountInitialized(UserConfig.selectedAccount);
-        SharedConfig.pushStringStatus = "__FIREBASE_GENERATING_SINCE_" + ConnectionsManager.getInstance(UserConfig.selectedAccount).getCurrentTime() + "__";
+        ensureAccountInitialized(startupAccount);
+        SharedConfig.pushStringStatus = "__FIREBASE_GENERATING_SINCE_" + ConnectionsManager.getInstance(startupAccount).getCurrentTime() + "__";
 
         ApplicationLoader app = (ApplicationLoader) ApplicationLoader.applicationContext;
         app.initPushServices();
@@ -363,8 +364,8 @@ public class ApplicationLoader extends Application {
 
         MediaController.getInstance();
         accountServicesReady = true;
-        ContactsController.getInstance(UserConfig.selectedAccount).checkAppAccount();
-        DownloadController.getInstance(UserConfig.selectedAccount);
+        ContactsController.getInstance(startupAccount).checkAppAccount();
+        DownloadController.getInstance(startupAccount);
         scheduleBackgroundAccountConnections();
         BillingController.getInstance().startConnection();
     }

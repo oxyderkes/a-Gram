@@ -91,6 +91,11 @@ enum ConnectionState {
     ConnectionStateConnectingViaProxy = 4
 };
 
+enum LogoutReason {
+    LogoutReasonLocalConfigMismatch = 0,
+    LogoutReasonServerAuthRejected = 1
+};
+
 enum EventObjectType {
     EventObjectTypeConnection,
     EventObjectTypeTimer,
@@ -144,7 +149,7 @@ typedef struct ConnectiosManagerDelegate {
     virtual void onSessionCreated(int32_t instanceNum) = 0;
     virtual void onConnectionStateChanged(ConnectionState state, int32_t instanceNum) = 0;
     virtual void onUnparsedMessageReceived(int64_t reqMessageId, NativeByteBuffer *buffer, ConnectionType connectionType, int32_t instanceNum) = 0;
-    virtual void onLogout(int32_t instanceNum) = 0;
+    virtual void onLogout(int32_t instanceNum, LogoutReason reason) = 0;
     virtual void onUpdateConfig(TL_config *config, int32_t instanceNum) = 0;
     virtual void onInternalPushReceived(int32_t instanceNum) = 0;
     virtual void onBytesSent(int32_t amount, int32_t networkType, int32_t instanceNum) = 0;

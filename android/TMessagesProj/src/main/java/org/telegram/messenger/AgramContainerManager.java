@@ -49,10 +49,15 @@ public final class AgramContainerManager {
     public static final int NOTIFICATION_AUTHOR = 1;
     public static final int NOTIFICATION_FULL = 2;
 
+    public static final String STORAGE_READY = "ready";
+    public static final String STORAGE_LOCKED = "locked";
+    public static final String STORAGE_QUARANTINED = "quarantined";
+
     private static final String REGISTRY = "agram_container_registry";
     private static final String SLOT_PREFIX = "slot_";
     private static final String METADATA_PREFIX = "metadata_";
     private static final String PUSH_INSTANCE_HASH_PREFIX = "push_instance_hash_";
+    private static final String QUARANTINE_PREFIX = "quarantine_";
     private static final int SCHEMA_VERSION = 6;
     private static final String LEGACY_DURESS_PREFS = "agram_duress_registry";
     private static final String LEGACY_DURESS_SCOPE = "agram_global_duress_v1";
@@ -106,11 +111,11 @@ public final class AgramContainerManager {
             String id = preferences.getString(SLOT_PREFIX + account, null);
             if (!TextUtils.isEmpty(id)) {
                 ContainerRecord record = readRecord(account, id);
-                if (record != null) {
+                if (record.isStorageAccessible()) {
                     ensureUniquePushInstanceLocked(record);
-                    recordCache.put(account, record);
-                    return record;
                 }
+                recordCache.put(account, record);
+                return record;
             }
             ContainerRecord record = createDefault(account);
             ensureUniquePushInstanceLocked(record);
@@ -128,11 +133,26 @@ public final class AgramContainerManager {
             String id = preferences.getString(SLOT_PREFIX + account, null);
             ContainerRecord record = TextUtils.isEmpty(id) ? null : readRecord(account, id);
             if (record != null) {
-                ensureUniquePushInstanceLocked(record);
+                if (record.isStorageAccessible()) {
+                    ensureUniquePushInstanceLocked(record);
+                }
                 recordCache.put(account, record);
             }
             return record;
         }
+    }
+
+    /** Retries a container after a transient Keystore failure without changing its mapping. */
+    public ContainerRecord retryContainerAccess(int account) {
+        synchronized (sync) {
+            recordCache.remove(account);
+            return getContainer(account);
+        }
+    }
+
+    public boolean isContainerAccessible(int account) {
+        ContainerRecord record = getContainer(account);
+        return record != null && record.isStorageAccessible();
     }
 
     /**
@@ -146,7 +166,7 @@ public final class AgramContainerManager {
             boolean active = UserConfig.getInstance(account).isClientActivated();
             if (record == null) {
                 record = ensureContainer(account);
-            } else if (active && !record.profileLocked) {
+            } else if (record.isStorageAccessible() && active && !record.profileLocked) {
                 record.profileLocked = true;
                 saveRecord(record);
             }
@@ -321,6 +341,7 @@ public final class AgramContainerManager {
                     .remove(SLOT_PREFIX + account)
                     .remove(METADATA_PREFIX + id)
                     .remove(PUSH_INSTANCE_HASH_PREFIX + id)
+                    .remove(QUARANTINE_PREFIX + id)
                     .commit();
             recordCache.remove(account);
             Utilities.globalQueue.postRunnable(() -> deleteRecursively(getContainerDirectory(id)));
@@ -442,6 +463,14 @@ public final class AgramContainerManager {
         public boolean ghostMinimizeOnline;
         public boolean ghostReadOnInteraction;
         public boolean ghostWarnBeforeInteraction;
+        /** Runtime-only recovery state; never written into encrypted metadata. */
+        public String storageState = STORAGE_READY;
+        public String storageError = "";
+
+        public boolean isStorageAccessible() {
+            return STORAGE_READY.equals(storageState);
+        }
+
         public boolean hasPin() {
             return !TextUtils.isEmpty(pinHash) && !TextUtils.isEmpty(pinSalt);
         }
@@ -658,6 +687,11 @@ public final class AgramContainerManager {
     }
 
     private void saveRecord(ContainerRecord record) {
+        if (!record.isStorageAccessible()) {
+            FileLog.e("Refusing to overwrite unavailable Agram container " + record.account
+                    + " (" + record.storageState + ":" + record.storageError + ")");
+            return;
+        }
         try {
             byte[] clear = toJson(record).toString().getBytes(StandardCharsets.UTF_8);
             byte[] encrypted = AgramSecureStore.encrypt(record.id, clear, AgramSecureStore.aad(record.id, "metadata"));
@@ -665,6 +699,7 @@ public final class AgramContainerManager {
                     .putString(SLOT_PREFIX + record.account, record.id)
                     .putString(METADATA_PREFIX + record.id, Base64.encodeToString(encrypted, Base64.NO_WRAP))
                     .putString(PUSH_INSTANCE_HASH_PREFIX + record.id, pushInstanceHash(record.agramPushInstance))
+                    .remove(QUARANTINE_PREFIX + record.id)
                     .commit();
             recordCache.put(record.account, record);
         } catch (Exception e) {
@@ -676,7 +711,7 @@ public final class AgramContainerManager {
         try {
             String encoded = preferences.getString(METADATA_PREFIX + id, null);
             if (TextUtils.isEmpty(encoded)) {
-                return null;
+                return quarantineRecord(account, id, STORAGE_QUARANTINED, "metadata_missing", null);
             }
             byte[] encrypted = Base64.decode(encoded, Base64.NO_WRAP);
             byte[] clear = AgramSecureStore.decrypt(id, encrypted, AgramSecureStore.aad(id, "metadata"));
@@ -699,11 +734,79 @@ public final class AgramContainerManager {
                 // metadata instead of only hiding their settings UI.
                 saveRecord(record);
             }
+            record.storageState = STORAGE_READY;
+            record.storageError = "";
+            preferences.edit().remove(QUARANTINE_PREFIX + id).apply();
             return record;
         } catch (Exception e) {
-            FileLog.e("Unable to read Agram container " + account, e);
-            return null;
+            boolean keyUnavailable = e instanceof AgramSecureStore.KeyUnavailableException;
+            return quarantineRecord(account, id,
+                    keyUnavailable ? STORAGE_LOCKED : STORAGE_QUARANTINED,
+                    containerReadError(e), e);
         }
+    }
+
+    private ContainerRecord quarantineRecord(int account, String id, String state,
+                                             String error, Exception cause) {
+        // Keep SLOT_PREFIX and METADATA_PREFIX untouched. The placeholder is
+        // deliberately fail-closed and can be retried if Keystore availability
+        // was only transient.
+        ContainerRecord record = new ContainerRecord();
+        record.id = id;
+        record.account = account;
+        record.name = defaultName(account) + " · locked";
+        record.color = defaultColor(account);
+        record.profileMode = PROFILE_MINIMAL;
+        record.profileLocked = true;
+        record.languageCode = normalizeLanguage(Locale.getDefault().getLanguage());
+        record.systemLanguageCode = normalizeLanguage(Locale.getDefault().toLanguageTag());
+        record.clientLanguageCode = record.languageCode;
+        record.timezoneOffset = systemTimezoneOffset();
+        record.proxyMode = NETWORK_PROXY;
+        record.proxyEnabled = true;
+        record.killSwitch = true;
+        record.proxyAddress = "127.0.0.1";
+        record.proxyPort = 1;
+        record.proxyUsername = "";
+        record.proxyPassword = "";
+        record.proxySecret = "";
+        record.torIsolationId = "";
+        record.pushMode = PUSH_DIRECT;
+        record.agramPushInstance = "";
+        record.agramPushEndpoint = "";
+        record.agramPushStatus = "container_locked";
+        record.notificationPrivacy = NOTIFICATION_HIDDEN;
+        record.ghostSuppressReadReceipts = true;
+        record.ghostSuppressStoryViews = true;
+        record.ghostSuppressTyping = true;
+        record.ghostMinimizeOnline = true;
+        record.ghostReadOnInteraction = true;
+        record.ghostWarnBeforeInteraction = true;
+        record.storageState = state;
+        record.storageError = error;
+        preferences.edit().putString(QUARANTINE_PREFIX + id, state + ":" + error).commit();
+        if (cause != null) {
+            FileLog.e("Agram container " + account + " is " + state + " (" + error + ")", cause);
+        } else {
+            FileLog.e("Agram container " + account + " is " + state + " (" + error + ")");
+        }
+        return record;
+    }
+
+    private static String containerReadError(Exception error) {
+        if (error instanceof AgramSecureStore.KeyUnavailableException) {
+            return "keystore_key_unavailable";
+        }
+        if (error instanceof GeneralSecurityException) {
+            return "metadata_authentication_failed";
+        }
+        if (error instanceof JSONException) {
+            return "metadata_invalid";
+        }
+        if (error instanceof IllegalArgumentException) {
+            return "metadata_encoding_invalid";
+        }
+        return "metadata_unreadable";
     }
 
     private JSONObject toJson(ContainerRecord record) throws JSONException {

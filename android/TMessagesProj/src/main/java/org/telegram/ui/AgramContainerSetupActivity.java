@@ -90,7 +90,7 @@ public class AgramContainerSetupActivity extends BaseFragment {
     private final AgramTorManager.Listener torStateListener = state -> updateTorStatusAction();
 
     public AgramContainerSetupActivity() {
-        this(UserConfig.selectedAccount);
+        this(UserConfig.getLoginTargetAccount());
     }
 
     public AgramContainerSetupActivity(int account) {
@@ -405,8 +405,7 @@ public class AgramContainerSetupActivity extends BaseFragment {
         if (hasActiveAccount) {
             presentFragment(new LoginActivity(account), true);
         } else {
-            UserConfig.selectedAccount = account;
-            UserConfig.getInstance(0).saveConfig(false);
+            UserConfig.setSelectedAccountPersisted(account);
             presentFragment(new LoginActivity(), true);
         }
     }

@@ -351,8 +351,12 @@ class Delegate : public ConnectiosManagerDelegate {
         }
     }
     
-    void onLogout(int32_t instanceNum) {
-        jniEnv[instanceNum]->CallStaticVoidMethod(jclass_ConnectionsManager, jclass_ConnectionsManager_onLogout, instanceNum);
+    void onLogout(int32_t instanceNum, LogoutReason reason) {
+        jniEnv[instanceNum]->CallStaticVoidMethod(
+                jclass_ConnectionsManager,
+                jclass_ConnectionsManager_onLogout,
+                instanceNum,
+                static_cast<int32_t>(reason));
     }
     
     void onUpdateConfig(TL_config *config, int32_t instanceNum) {
@@ -662,7 +666,7 @@ extern "C" int registerNativeTgNetFunctions(JavaVM *vm, JNIEnv *env) {
     if (jclass_ConnectionsManager_onSessionCreated == 0) {
         return JNI_FALSE;
     }
-    jclass_ConnectionsManager_onLogout = env->GetStaticMethodID(jclass_ConnectionsManager, "onLogout", "(I)V");
+    jclass_ConnectionsManager_onLogout = env->GetStaticMethodID(jclass_ConnectionsManager, "onLogout", "(II)V");
     if (jclass_ConnectionsManager_onLogout == 0) {
         return JNI_FALSE;
     }

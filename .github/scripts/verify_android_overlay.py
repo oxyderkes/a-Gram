@@ -22,6 +22,7 @@ main_manifest = read("TMessagesProj/src/main/AndroidManifest.xml")
 standalone_manifest = read("TMessagesProj/config/release/AndroidManifest_standalone.xml")
 message_object = read("TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java")
 container_manager = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramContainerManager.java")
+secure_store = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramSecureStore.java")
 push_controller = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramPushController.java")
 network_controller = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramNetworkController.java")
 tor_manager = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramTorManager.java")
@@ -33,6 +34,11 @@ stories_controller = read("TMessagesProj/src/main/java/org/telegram/ui/Stories/S
 chat_activity = read("TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java")
 launch_activity = read("TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java")
 application_loader = read("TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java")
+user_config = read("TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java")
+intro_activity = read("TMessagesProj/src/main/java/org/telegram/ui/IntroActivity.java")
+native_config = read("TMessagesProj/jni/tgnet/Config.cpp")
+native_connections = read("TMessagesProj/jni/tgnet/ConnectionsManager.cpp")
+java_connections = read("TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java")
 standalone_app_manifest = read("TMessagesProj_AppStandalone/src/main/AndroidManifest.xml")
 
 for label, source in (("core", core_gradle), ("standalone", standalone_gradle)):
@@ -108,6 +114,39 @@ if "purgeOrphanedContainers()" in application_loader:
     errors.append("cold start must not infer logout and delete containers")
 if "deleteContainer(currentAccount)" not in messages_controller:
     errors.append("confirmed logout container cleanup is missing")
+
+required_account_selection_guards = (
+    (user_config, "ACCOUNT_SELECTION_PREFERENCES"),
+    (user_config, "setSelectedAccountPersisted"),
+    (user_config, "reconcileSelectedAccount"),
+    (user_config, "getLoginTargetAccount"),
+    (application_loader, "UserConfig.reconcileSelectedAccount()"),
+    (intro_activity, "UserConfig.getLoginTargetAccount()"),
+)
+for source, guard in required_account_selection_guards:
+    if guard not in source:
+        errors.append(f"durable account-selection guard is missing: {guard}")
+if re.search(r"UserConfig\.selectedAccount\s*=\s*[^=]", launch_activity + messages_controller + container_setup + intro_activity):
+    errors.append("selected account must be changed through the synchronous registry")
+
+required_session_persistence_guards = (
+    (native_config, "isValidConfigFile"),
+    (native_config, "configValid && backupValid"),
+    (native_config, "remove(backupPath.c_str())"),
+    (native_connections, "LogoutReasonLocalConfigMismatch"),
+    (native_connections, "localAuthConfigQuarantined"),
+    (java_connections, "LogoutReasonServerAuthRejected"),
+    (java_connections, "sessionAuthConfigMismatch"),
+    (secure_store, "getExistingKey(scope)"),
+    (secure_store, "KeyUnavailableException"),
+    (container_manager, "STORAGE_QUARANTINED"),
+    (container_manager, "Refusing to overwrite unavailable Agram container"),
+)
+for source, guard in required_session_persistence_guards:
+    if guard not in source:
+        errors.append(f"session-preservation guard is missing: {guard}")
+if "Cipher.DECRYPT_MODE, getOrCreateKey(scope)" in secure_store:
+    errors.append("decrypt must never create a replacement Keystore key")
 
 for label, manifest in (("main", main_manifest), ("standalone", standalone_manifest)):
     if 'android:allowBackup="false"' not in manifest or 'android:fullBackupContent="false"' not in manifest:

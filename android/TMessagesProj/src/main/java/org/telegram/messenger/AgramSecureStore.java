@@ -11,6 +11,7 @@ import android.security.keystore.StrongBoxUnavailableException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
+import java.security.Key;
 import java.security.KeyStore;
 import java.security.MessageDigest;
 import java.util.Locale;
@@ -69,7 +70,11 @@ public final class AgramSecureStore {
         input.get(encrypted);
 
         Cipher cipher = Cipher.getInstance(CIPHER);
-        cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(scope), new GCMParameterSpec(128, iv));
+        // Decryption must never create a replacement key. If Android has lost
+        // or invalidated the original alias, generating a new key would only
+        // make the existing ciphertext look corrupt and could tempt callers to
+        // overwrite an otherwise recoverable container mapping.
+        cipher.init(Cipher.DECRYPT_MODE, getExistingKey(scope), new GCMParameterSpec(128, iv));
         if (associatedData != null) {
             cipher.updateAAD(associatedData);
         }
@@ -110,6 +115,39 @@ public final class AgramSecureStore {
             throw e;
         } catch (Exception e) {
             throw new GeneralSecurityException("Android Keystore is unavailable", e);
+        }
+    }
+
+    private static SecretKey getExistingKey(String scope) throws GeneralSecurityException {
+        try {
+            KeyStore keyStore = KeyStore.getInstance(ANDROID_KEYSTORE);
+            keyStore.load(null);
+            String alias = aliasFor(scope);
+            if (!keyStore.containsAlias(alias)) {
+                throw new KeyUnavailableException("Agram container key is missing");
+            }
+            Key key = keyStore.getKey(alias, null);
+            if (!(key instanceof SecretKey)) {
+                throw new KeyUnavailableException("Agram container key is invalid");
+            }
+            return (SecretKey) key;
+        } catch (KeyUnavailableException e) {
+            throw e;
+        } catch (GeneralSecurityException e) {
+            throw new KeyUnavailableException("Android Keystore key is unavailable", e);
+        } catch (Exception e) {
+            throw new KeyUnavailableException("Android Keystore key is unavailable", e);
+        }
+    }
+
+    /** Signals a recoverable Keystore problem without exposing an alias. */
+    public static final class KeyUnavailableException extends GeneralSecurityException {
+        public KeyUnavailableException(String message) {
+            super(message);
+        }
+
+        public KeyUnavailableException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 

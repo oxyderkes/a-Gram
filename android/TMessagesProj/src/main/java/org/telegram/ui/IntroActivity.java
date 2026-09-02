@@ -97,7 +97,7 @@ public class IntroActivity extends BaseFragment implements NotificationCenter.No
     private final Object pagerHeaderTag = new Object(),
             pagerMessageTag = new Object();
 
-    private final int currentAccount = UserConfig.selectedAccount;
+    private final int currentAccount = UserConfig.getLoginTargetAccount();
 
     private ViewPager viewPager;
     private BottomPagesView bottomPages;
@@ -384,7 +384,7 @@ public class IntroActivity extends BaseFragment implements NotificationCenter.No
             }
             startPressed = true;
 
-            presentFragment(new AgramContainerSetupActivity(UserConfig.selectedAccount), true);
+            presentFragment(new AgramContainerSetupActivity(UserConfig.getLoginTargetAccount()), true);
             destroyed = true;
         });
 
@@ -413,7 +413,7 @@ public class IntroActivity extends BaseFragment implements NotificationCenter.No
 
                         NotificationCenter.getGlobalInstance().removeObserver(this, id);
                         AndroidUtilities.runOnUIThread(()->{
-                            presentFragment(new AgramContainerSetupActivity(UserConfig.selectedAccount), true);
+                            presentFragment(new AgramContainerSetupActivity(UserConfig.getLoginTargetAccount()), true);
                             destroyed = true;
                         }, 100);
                     }

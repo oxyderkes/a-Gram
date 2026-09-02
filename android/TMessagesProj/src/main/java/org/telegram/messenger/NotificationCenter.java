@@ -165,6 +165,7 @@ public class NotificationCenter {
     public static final int httpFileDidLoad = totalEvents++;
     public static final int httpFileDidFailedLoad = totalEvents++;
     public static final int didUpdateConnectionState = totalEvents++;
+    public static final int sessionAuthConfigMismatch = totalEvents++;
     public static final int fileUploaded = totalEvents++;
     public static final int fileUploadFailed = totalEvents++;
     public static final int fileUploadProgressChanged = totalEvents++;

@@ -13,6 +13,7 @@ import android.text.TextUtils;
 import android.util.Base64;
 
 import androidx.annotation.Keep;
+import androidx.annotation.IntDef;
 
 import com.google.android.exoplayer2.upstream.DefaultBandwidthMeter;
 import com.google.android.gms.tasks.Task;
@@ -59,6 +60,8 @@ import java.net.NetworkInterface;
 import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.net.URLConnection;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Enumeration;
@@ -109,6 +112,14 @@ public class ConnectionsManager extends BaseController {
     public final static int ConnectionStateConnectingToProxy = 4;
     public final static int ConnectionStateUpdating = 5;
 
+    public final static int LogoutReasonLocalConfigMismatch = 0;
+    public final static int LogoutReasonServerAuthRejected = 1;
+
+    @IntDef({LogoutReasonLocalConfigMismatch, LogoutReasonServerAuthRejected})
+    @Retention(RetentionPolicy.SOURCE)
+    public @interface LogoutReason {
+    }
+
     public final static byte USE_IPV4_ONLY = 0;
     public final static byte USE_IPV6_ONLY = 1;
     public final static byte USE_IPV4_IPV6_RANDOM = 2;
@@ -121,6 +132,7 @@ public class ConnectionsManager extends BaseController {
     private boolean appPaused = true;
     private boolean isUpdating;
     private int connectionState;
+    private volatile boolean localAuthConfigQuarantined;
     private AtomicInteger lastRequestToken = new AtomicInteger(1);
     private int appResumeCount;
 
@@ -671,6 +683,10 @@ public class ConnectionsManager extends BaseController {
         return connectionState;
     }
 
+    public boolean isLocalAuthConfigQuarantined() {
+        return localAuthConfigQuarantined;
+    }
+
     public void setUserId(long id) {
         native_setUserId(currentAccount, id);
     }
@@ -877,14 +893,31 @@ public class ConnectionsManager extends BaseController {
         });
     }
 
-    public static void onLogout(final int currentAccount) {
+    public static void onLogout(final int currentAccount, @LogoutReason final int reason) {
         AndroidUtilities.runOnUIThread(() -> {
+            if (reason == LogoutReasonLocalConfigMismatch) {
+                ConnectionsManager manager = getInstance(currentAccount);
+                manager.localAuthConfigQuarantined = true;
+                manager.connectionState = ConnectionStateWaitingForNetwork;
+                native_pauseNetwork(currentAccount);
+                FileLog.e("Agram quarantined account " + currentAccount
+                        + ": Telegram user data exists but the local MTProto config/auth key is unavailable; preserving session data");
+                NotificationCenter.getInstance(currentAccount).postNotificationName(
+                        NotificationCenter.sessionAuthConfigMismatch,
+                        reason);
+                NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.didUpdateConnectionState);
+                return;
+            }
             AccountInstance accountInstance = AccountInstance.getInstance(currentAccount);
             if (accountInstance.getUserConfig().getClientUserId() != 0) {
-                // A definitive server-side revocation follows the same teardown
-                // path as a manual logout. Agram must not retain an unusable
-                // account card or reuse its container identity.
-                accountInstance.getMessagesController().performLogout(0, true);
+                if (reason == LogoutReasonServerAuthRejected) {
+                    // A definitive server-side revocation follows the same teardown
+                    // path as a manual logout. Agram must not retain an unusable
+                    // account card or reuse its container identity.
+                    accountInstance.getMessagesController().performLogout(0, true);
+                } else {
+                    FileLog.e("Ignoring unknown native logout reason " + reason + " for account " + currentAccount);
+                }
             }
         });
     }
