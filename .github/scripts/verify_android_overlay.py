@@ -27,6 +27,7 @@ network_controller = read("TMessagesProj/src/main/java/org/telegram/messenger/Ag
 tor_manager = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramTorManager.java")
 session_route = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramSessionRouteController.java")
 container_setup = read("TMessagesProj/src/main/java/org/telegram/ui/AgramContainerSetupActivity.java")
+dialogs_activity = read("TMessagesProj/src/main/java/org/telegram/ui/DialogsActivity.java")
 messages_controller = read("TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java")
 stories_controller = read("TMessagesProj/src/main/java/org/telegram/ui/Stories/StoriesController.java")
 chat_activity = read("TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java")
@@ -94,6 +95,10 @@ if "onTransportFailure" in tor_manager or "onTransportConnectionIssue" not in to
     errors.append("individual pluggable-transport connection failures must remain retryable")
 if "Tor must remain alive so it can try the next bridge" not in tor_manager:
     errors.append("bridge failover guard is missing")
+if "agramRouteItem" in dialogs_activity or "100% · подключено" in dialogs_activity:
+    errors.append("removed Tor status pill returned to the dialogs header")
+if "agramNetworkItem" not in dialogs_activity or "AgramTorSettingsActivity(currentAccount)" not in dialogs_activity:
+    errors.append("Tor/proxy settings icon is missing from the dialogs header")
 
 if "ensureUniquePushInstanceLocked" not in container_manager:
     errors.append("legacy duplicate push instances are not repaired")

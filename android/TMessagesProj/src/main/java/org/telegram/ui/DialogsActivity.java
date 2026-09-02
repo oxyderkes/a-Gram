@@ -310,7 +310,6 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
     private static final int ANIMATOR_ID_FILTER_TABS_VISIBLE = 8;
     private static final int ANIMATOR_ID_SEARCH_FILTER_TABS_VISIBLE = 9;
     private static final int GHOST_MODE_ITEM_ID = -1001;
-    private static final int AGRAM_ROUTE_ITEM_ID = -1002;
     private static final int AGRAM_NETWORK_ITEM_ID = -1003;
 
     private final BoolAnimator animatorSearchVisible = new BoolAnimator(ANIMATOR_ID_SEARCH_VISIBLE,
@@ -514,7 +513,6 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
     public ActionBarMenuItem searchItem;
     private ActionBarMenuItem optionsItem;
     private ActionBarMenuItem ghostModeItem;
-    private ActionBarMenuItem agramRouteItem;
     private ActionBarMenuItem agramNetworkItem;
     private ProxyDrawable agramNetworkDrawable;
     private ActionBarMenuItem speedItem;
@@ -3460,30 +3458,6 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         fragmentSearchFieldWatcher.setDoNotCloseAfterFieldEmpty();
 
         if (initialDialogsType == DIALOGS_TYPE_DEFAULT && !onlySelect && searchString == null && folderId == 0 && communityId == 0) {
-            agramRouteItem = menu.addItem(AGRAM_ROUTE_ITEM_ID, "МАРШРУТ\nне настроен");
-            TextView routeText = agramRouteItem.getTextView();
-            routeText.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.5f);
-            routeText.setGravity(Gravity.CENTER);
-            routeText.setSingleLine(false);
-            routeText.setMaxLines(2);
-            routeText.setEllipsize(TextUtils.TruncateAt.END);
-            routeText.setPadding(dp(6), dp(3), dp(6), dp(3));
-            GradientDrawable routeBackground = new GradientDrawable();
-            routeBackground.setColor(ColorUtils.setAlphaComponent(
-                    getThemedColor(Theme.key_actionBarDefaultIcon), 22));
-            routeBackground.setStroke(dp(1), ColorUtils.setAlphaComponent(
-                    getThemedColor(Theme.key_actionBarDefaultIcon), 70));
-            routeBackground.setCornerRadius(dp(12));
-            routeText.setBackground(routeBackground);
-            ViewGroup.LayoutParams rawParams = agramRouteItem.getLayoutParams();
-            if (rawParams instanceof LinearLayout.LayoutParams) {
-                LinearLayout.LayoutParams params = (LinearLayout.LayoutParams) rawParams;
-                params.width = dp(112);
-                params.leftMargin = dp(2);
-                params.rightMargin = dp(2);
-                agramRouteItem.setLayoutParams(params);
-            }
-            agramRouteItem.setOnClickListener(v -> presentFragment(new AgramTorSettingsActivity(currentAccount)));
             agramNetworkDrawable = new ProxyDrawable(context);
             agramNetworkDrawable.setColorFilter(new PorterDuffColorFilter(
                     getThemedColor(Theme.key_actionBarDefaultIcon), PorterDuff.Mode.MULTIPLY));
@@ -7108,7 +7082,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
     }
 
     private void updateAgramRouteHeader() {
-        if (agramRouteItem == null) {
+        if (agramNetworkItem == null && agramNetworkDrawable == null) {
             return;
         }
         AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(currentAccount);
@@ -7121,7 +7095,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             modeLabel = AgramTorManager.STATE_READY.equals(torState) ? "◉ TOR" :
                     (AgramTorManager.STATE_ERROR.equals(torState) ? "! TOR" : "… TOR");
             if (AgramTorManager.STATE_READY.equals(torState)) {
-                secondLine = "100% · подключено";
+                secondLine = "соединение установлено";
             } else if (AgramTorManager.STATE_STARTING.equals(torState)) {
                 secondLine = tor.getBootstrapProgress() + "% · подключение";
             } else if (AgramTorManager.STATE_ERROR.equals(torState)) {
@@ -7136,8 +7110,6 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             modeLabel = "● DIRECT";
             secondLine = "прямое соединение";
         }
-        agramRouteItem.getTextView().setText(modeLabel + "\n" + secondLine);
-        agramRouteItem.setContentDescription(modeLabel + ". " + secondLine + ". Открыть настройки маршрута");
         if (agramNetworkDrawable != null) {
             boolean routed = !AgramContainerManager.NETWORK_DIRECT.equals(mode);
             String networkState = AgramNetworkController.getInstance().getState(currentAccount);
