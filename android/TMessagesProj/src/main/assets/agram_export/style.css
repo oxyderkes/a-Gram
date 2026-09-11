@@ -310,6 +310,11 @@ a:hover {
     color: #888888;
 }
 
+@page {
+    size: A4;
+    margin: 12mm 10mm;
+}
+
 @media print {
     html, body { background: #ffffff; }
     .page_header { position: static; border-bottom: 1px solid #dddddd; }

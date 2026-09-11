@@ -45129,7 +45129,7 @@ public class ChatActivity extends BaseFragment implements
                         getString(R.string.AGramExportDateRange)
                 }, (dialog, which) -> {
                     if (which == 0) {
-                        startAgramExport(senderId, 0, 0);
+                        showAgramExportFormatChoice(senderId, 0, 0);
                     } else {
                         pickAgramExportDateRange(senderId);
                     }
@@ -45159,7 +45159,9 @@ public class ChatActivity extends BaseFragment implements
                     showAgramExportError(getString(R.string.AGramExportInvalidDateRange));
                     return;
                 }
-                startAgramExport(senderId, (int) (start.getTimeInMillis() / 1000L), (int) (end.getTimeInMillis() / 1000L));
+                showAgramExportFormatChoice(senderId,
+                        (int) (start.getTimeInMillis() / 1000L),
+                        (int) (end.getTimeInMillis() / 1000L));
             }, suggestedEnd.get(Calendar.YEAR), suggestedEnd.get(Calendar.MONTH), suggestedEnd.get(Calendar.DAY_OF_MONTH));
             endPicker.setTitle(getString(R.string.AGramExportPickEnd));
             endPicker.getDatePicker().setMinDate(start.getTimeInMillis());
@@ -45175,6 +45177,22 @@ public class ChatActivity extends BaseFragment implements
         startPicker.show();
     }
 
+    private void showAgramExportFormatChoice(long senderId, int minDateSec, int maxDateSec) {
+        if (getParentActivity() == null) {
+            return;
+        }
+        new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                .setTitle(getString(R.string.AGramExportChooseFormat))
+                .setItems(new CharSequence[]{
+                        getString(R.string.AGramExportFormatHtml),
+                        getString(R.string.AGramExportFormatPdf)
+                }, (dialog, which) -> startAgramExport(senderId, minDateSec, maxDateSec,
+                        which == 1 ? AgramChatExportManager.Format.PDF
+                                : AgramChatExportManager.Format.HTML_ZIP))
+                .setNegativeButton(getString(R.string.Cancel), null)
+                .show();
+    }
+
     private String getAgramExportTitle() {
         if (currentChat != null && !TextUtils.isEmpty(currentChat.title)) {
             return currentChat.title;
@@ -45185,7 +45203,8 @@ public class ChatActivity extends BaseFragment implements
         return getString(R.string.AGramExportChat);
     }
 
-    private void startAgramExport(long senderId, int minDateSec, int maxDateSec) {
+    private void startAgramExport(long senderId, int minDateSec, int maxDateSec,
+                                  AgramChatExportManager.Format format) {
         if (!canOfferAgramExport() || getParentActivity() == null) {
             showAgramExportError(getString(R.string.AGramExportProtectedUnavailable));
             return;
@@ -45206,7 +45225,7 @@ public class ChatActivity extends BaseFragment implements
                 .create();
         showDialog(agramExportProgressDialog);
         agramExportTask = AgramChatExportManager.start(currentAccount, dialog_id, mergeDialogId,
-                getAgramExportTitle(), senderId, minDateSec, maxDateSec,
+                getAgramExportTitle(), senderId, minDateSec, maxDateSec, format,
                 new AgramChatExportManager.Listener() {
             @Override
             public void onProgress(int processed, int total, String stage) {
@@ -45264,7 +45283,8 @@ public class ChatActivity extends BaseFragment implements
         try {
             Uri uri = FileProvider.getUriForFile(activity, ApplicationLoader.getApplicationId() + ".provider", archive);
             Intent send = new Intent(Intent.ACTION_SEND);
-            send.setType("application/zip");
+            String lowerName = archive.getName().toLowerCase(Locale.US);
+            send.setType(lowerName.endsWith(".pdf") ? "application/pdf" : "application/zip");
             send.putExtra(Intent.EXTRA_STREAM, uri);
             send.setClipData(ClipData.newUri(activity.getContentResolver(), archive.getName(), uri));
             send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);

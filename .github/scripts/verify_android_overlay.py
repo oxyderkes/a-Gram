@@ -30,7 +30,10 @@ push_controller = read("TMessagesProj/src/main/java/org/telegram/messenger/Agram
 network_controller = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramNetworkController.java")
 deleted_media_store = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramDeletedMediaStore.java")
 chat_export = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramChatExportManager.java")
+chat_export_pdf = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramHtmlPdfRenderer.java")
 chat_export_style = read("TMessagesProj/src/main/assets/agram_export/style.css")
+strings_en = read("TMessagesProj/src/main/res/values/strings.xml")
+strings_ru = read("TMessagesProj/src/main/res/values-ru/strings.xml")
 messages_storage = read("TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java")
 file_loader = read("TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java")
 image_loader = read("TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java")
@@ -244,6 +247,13 @@ required_chat_export_guards = (
     "page.nextCursor",
     "mergeDialogId",
     "areSourceDialogsExportable()",
+    "enum Format",
+    "HTML_ZIP",
+    "format == Format.PDF",
+    "AgramHtmlPdfRenderer.render(",
+    "pdfRenderTask",
+    "renderTask.cancel()",
+    "baseName + \".pdf\"",
     "isSessionValid()",
     "containerId",
     "RETIRED_CONTAINERS",
@@ -257,6 +267,33 @@ if "Utilities.globalQueue" in chat_export:
     errors.append("chat export orchestration must use its own serial DispatchQueue")
 if 'loading=\\"lazy\\"' not in chat_export or 'loading=\\"eager\\"' in chat_export:
     errors.append("chat export images must use native lazy loading")
+pdf_branch = re.search(
+    r"if\s*\(format\s*==\s*Format\.PDF\)\s*\{(?P<body>.*?)\n\s*\}",
+    chat_export,
+    re.DOTALL,
+)
+if pdf_branch is None or "startPdfRender(" not in pdf_branch.group("body"):
+    errors.append("PDF export must branch into the asynchronous HTML-to-PDF renderer")
+elif "zipDirectory(" in pdf_branch.group("body"):
+    errors.append("PDF export must not package its staging directory as ZIP")
+required_pdf_renderer_guards = (
+    "interface Callback",
+    "class RenderTask",
+    "static RenderTask render(",
+    "new PdfDocument()",
+    "PAGE_WIDTH_POINTS = 595",
+    "PAGE_HEIGHT_POINTS = 842",
+    "MAX_PDF_PAGES = 150",
+    "pageImageWaitScript(",
+    "temporaryOutputFile.renameTo(outputFile)",
+)
+for guard in required_pdf_renderer_guards:
+    if guard not in chat_export_pdf:
+        errors.append(f"HTML-to-PDF renderer guard is missing: {guard}")
+if "PrintDocumentAdapter" in chat_export_pdf:
+    errors.append("PDF renderer must not use inaccessible PrintDocumentAdapter callbacks")
+if not re.search(r"@page\s*\{[^}]*size:\s*A4\s*;[^}]*margin:\s*12mm\s+10mm\s*;", chat_export_style, re.DOTALL):
+    errors.append("chat export print CSS must retain A4 page size and margins")
 if not re.search(r"\.message\.deleted\s*\{[^}]*opacity:\s*\.?(?:40|4)\s*;", chat_export_style, re.DOTALL):
     errors.append("deleted messages in HTML export must render at 40% opacity")
 if not re.search(
@@ -275,10 +312,27 @@ if not all(
         "userInfo != null",
         "showAgramExportParticipantPicker()",
         "pickAgramExportDateRange(",
+        "showAgramExportFormatChoice(",
+        "AgramChatExportManager.Format.PDF",
         "AgramChatExportManager.start(currentAccount, dialog_id, mergeDialogId,",
+        '"application/pdf"',
+        '"application/zip"',
     )
 ):
     errors.append("chat export UI must retain its scope, date and protected-chat guards")
+for name in (
+    "AGramExportChooseFormat",
+    "AGramExportFormatHtml",
+    "AGramExportFormatPdf",
+    "AGramExportStageHistory",
+    "AGramExportStageDeleted",
+    "AGramExportStageHtml",
+    "AGramExportStageZip",
+    "AGramExportStagePdf",
+):
+    marker = f'name="{name}"'
+    if marker not in strings_en or marker not in strings_ru:
+        errors.append(f"localized chat export string is missing: {name}")
 
 required_deleted_media_store_guards = (
     "deleted_media",

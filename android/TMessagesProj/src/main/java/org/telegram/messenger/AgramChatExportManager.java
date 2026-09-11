@@ -39,12 +39,13 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 /**
- * Builds a self-contained HTML archive for an ordinary Telegram cloud dialog.
+ * Builds a self-contained HTML ZIP or PDF export for an ordinary Telegram cloud dialog.
  *
  * <p>The exporter deliberately does not use Telegram's in-memory message list: large dialogs are
  * paged from the API into a small temporary SQLite database and streamed from there into HTML.
  * The local Agram deletion snapshot is merged last, so a locally retained ordinary message wins
- * over a server copy with the same id. Secret chats, disappearing/view-once media and protected
+ * over a server copy with the same id. Both output formats use the same staged HTML and locally
+ * available media. Secret chats, disappearing/view-once media and protected
  * content are rejected both at the dialog boundary and again for every message.</p>
  */
 public final class AgramChatExportManager {
@@ -56,6 +57,11 @@ public final class AgramChatExportManager {
     private static final DispatchQueue CACHE_QUEUE = new DispatchQueue("agramExportCache");
 
     private AgramChatExportManager() {
+    }
+
+    public enum Format {
+        HTML_ZIP,
+        PDF
     }
 
     public interface Listener {
@@ -90,7 +96,15 @@ public final class AgramChatExportManager {
      */
     public static ExportTask start(int account, long dialogId, String title, long senderId,
                                    int minDateSec, int maxDateSec, Listener listener) {
-        return start(account, dialogId, 0, title, senderId, minDateSec, maxDateSec, listener);
+        return start(account, dialogId, 0, title, senderId, minDateSec, maxDateSec,
+                Format.HTML_ZIP, listener);
+    }
+
+    public static ExportTask start(int account, long dialogId, String title, long senderId,
+                                   int minDateSec, int maxDateSec, Format format,
+                                   Listener listener) {
+        return start(account, dialogId, 0, title, senderId, minDateSec, maxDateSec,
+                format, listener);
     }
 
     /**
@@ -100,13 +114,20 @@ public final class AgramChatExportManager {
     public static ExportTask start(int account, long dialogId, long mergeDialogId, String title,
                                    long senderId, int minDateSec, int maxDateSec,
                                    Listener listener) {
+        return start(account, dialogId, mergeDialogId, title, senderId, minDateSec, maxDateSec,
+                Format.HTML_ZIP, listener);
+    }
+
+    public static ExportTask start(int account, long dialogId, long mergeDialogId, String title,
+                                   long senderId, int minDateSec, int maxDateSec, Format format,
+                                   Listener listener) {
         long clientUserId = UserConfig.getInstance(account).getClientUserId();
         AgramContainerManager.ContainerRecord container =
                 AgramContainerManager.getInstance().getContainer(account);
         String containerId = container == null ? "" : container.id;
         Worker worker = new Worker(account, dialogId, mergeDialogId, title, senderId,
                 Math.max(0, minDateSec), Math.max(0, maxDateSec), clientUserId,
-                containerId, listener);
+                containerId, format == null ? Format.HTML_ZIP : format, listener);
         worker.exportQueue.postRunnable(worker::start);
         return new ExportTask(worker);
     }
@@ -132,6 +153,7 @@ public final class AgramChatExportManager {
         private final int maxDateSec;
         private final long clientUserId;
         private final String containerId;
+        private final Format format;
         private final Listener listener;
         private final DispatchQueue exportQueue;
         private final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -144,6 +166,7 @@ public final class AgramChatExportManager {
         private File outputFile;
         private SQLiteDatabase database;
         private volatile int currentRequestId;
+        private volatile AgramHtmlPdfRenderer.RenderTask pdfRenderTask;
         private int networkSourceIndex;
         private int offsetId;
         private int fetchedCount;
@@ -156,7 +179,7 @@ public final class AgramChatExportManager {
 
         private Worker(int account, long dialogId, long mergeDialogId, String title, long senderId,
                        int minDateSec, int maxDateSec, long clientUserId,
-                       String containerId, Listener listener) {
+                       String containerId, Format format, Listener listener) {
             this.account = account;
             this.sourceDialogIds = mergeDialogId != 0 && mergeDialogId != dialogId
                     ? new long[]{dialogId, mergeDialogId}
@@ -167,6 +190,7 @@ public final class AgramChatExportManager {
             this.maxDateSec = maxDateSec;
             this.clientUserId = clientUserId;
             this.containerId = containerId;
+            this.format = format;
             this.listener = listener;
             this.sourceExpectedCounts = new int[sourceDialogIds.length];
             this.exportQueue = new DispatchQueue("agramChatExport-" + UUID.randomUUID());
@@ -244,7 +268,7 @@ public final class AgramChatExportManager {
                 return;
             }
 
-            notifyProgress(0, 0, "Загрузка истории");
+            notifyProgress(0, 0, LocaleController.getString(R.string.AGramExportStageHistory));
             requestNextPage();
         }
 
@@ -390,7 +414,8 @@ public final class AgramChatExportManager {
 
                 int resultSize = result.messages == null ? 0 : result.messages.size();
                 fetchedCount += resultSize;
-                notifyProgress(fetchedCount, expectedCount, "Загрузка истории");
+                notifyProgress(fetchedCount, expectedCount,
+                        LocaleController.getString(R.string.AGramExportStageHistory));
 
                 boolean belowLowerBound = minDateSec != 0
                         && oldestDate != Integer.MAX_VALUE && oldestDate < minDateSec;
@@ -417,7 +442,8 @@ public final class AgramChatExportManager {
             offsetId = 0;
             previousOffsetId = -1;
             if (networkSourceIndex < sourceDialogIds.length) {
-                notifyProgress(fetchedCount, expectedCount, "Загрузка истории");
+                notifyProgress(fetchedCount, expectedCount,
+                        LocaleController.getString(R.string.AGramExportStageHistory));
                 requestNextPage();
             } else {
                 beginDeletedPages();
@@ -445,14 +471,14 @@ public final class AgramChatExportManager {
                 return;
             }
             if (deletedSourceIndex >= sourceDialogIds.length) {
-                createArchive();
+                createOutput();
                 return;
             }
 
             final long sourceDialogId = sourceDialogIds[deletedSourceIndex];
             final MessagesStorage.AgramExportPageCursor requestedCursor = deletedCursor;
             notifyProgress(fetchedCount + deletedProcessedCount, expectedCount,
-                    "Добавление удалённых сообщений");
+                    LocaleController.getString(R.string.AGramExportStageDeleted));
             try {
                 MessagesStorage.getInstance(account).getAgramDeletedMessagesForExportPage(
                         sourceDialogId, minDateSec, maxDateSec, senderId, requestedCursor, PAGE_SIZE,
@@ -764,7 +790,7 @@ public final class AgramChatExportManager {
             return new MediaInfo(kind, folder + "/" + destinationName, displayName, metadata);
         }
 
-        private void createArchive() {
+        private void createOutput() {
             if (cancelled.get()) {
                 finishCancelled();
                 return;
@@ -773,11 +799,16 @@ public final class AgramChatExportManager {
                 finishError("Сессия или контейнер изменились во время экспорта");
                 return;
             }
+            if (!areSourceDialogsExportable()) {
+                finishError("Защита контента была включена во время экспорта");
+                return;
+            }
             try {
-                int messageCount = queryCount("SELECT COUNT(*) FROM export_messages");
-                int deletedCount = queryCount("SELECT COUNT(*) FROM export_messages WHERE deleted = 1");
-                notifyProgress(messageCount, messageCount, "Формирование HTML");
-                writeHtml(messageCount, deletedCount);
+                final int messageCount = queryCount("SELECT COUNT(*) FROM export_messages");
+                final int deletedCount = queryCount("SELECT COUNT(*) FROM export_messages WHERE deleted = 1");
+                notifyProgress(messageCount, messageCount,
+                        LocaleController.getString(R.string.AGramExportStageHtml));
+                File htmlFile = writeHtml(messageCount, deletedCount);
 
                 if (database != null) {
                     database.close();
@@ -790,24 +821,31 @@ public final class AgramChatExportManager {
                 if (cancelled.get()) {
                     throw new ExportCancelledException();
                 }
-                notifyProgress(messageCount, messageCount, "Упаковка архива");
-                File exportRoot = new File(ApplicationLoader.applicationContext.getCacheDir(),
-                        "agram_chat_exports");
-                File readyDirectory = new File(new File(exportRoot, safeFileName(containerId)), "ready");
-                ensureDirectory(readyDirectory);
-                String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(new Date());
-                outputFile = new File(readyDirectory, "agram-export-" + safeFileName(title)
-                        + "-" + stamp + ".zip");
-                zipDirectory(stageDirectory, outputFile);
                 if (!isSessionValid()) {
                     throw new SessionChangedException();
                 }
                 if (!areSourceDialogsExportable()) {
                     throw new ProtectedSourceException();
                 }
-                deleteRecursively(stageDirectory);
-                stageDirectory = null;
-                finishSuccess(outputFile, messageCount, deletedCount);
+                File exportRoot = new File(ApplicationLoader.applicationContext.getCacheDir(),
+                        "agram_chat_exports");
+                File readyDirectory = new File(new File(exportRoot, safeFileName(containerId)), "ready");
+                ensureDirectory(readyDirectory);
+                String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(new Date());
+                String baseName = "agram-export-" + safeFileName(title) + "-" + stamp;
+                if (format == Format.PDF) {
+                    notifyProgress(messageCount, messageCount,
+                            LocaleController.getString(R.string.AGramExportStagePdf));
+                    outputFile = new File(readyDirectory, baseName + ".pdf");
+                    startPdfRender(htmlFile, messageCount, deletedCount);
+                    return;
+                }
+
+                notifyProgress(messageCount, messageCount,
+                        LocaleController.getString(R.string.AGramExportStageZip));
+                outputFile = new File(readyDirectory, baseName + ".zip");
+                zipDirectory(stageDirectory, outputFile);
+                completeOutput(messageCount, deletedCount);
             } catch (ExportCancelledException e) {
                 finishCancelled();
             } catch (SessionChangedException e) {
@@ -815,9 +853,74 @@ public final class AgramChatExportManager {
             } catch (ProtectedSourceException e) {
                 finishError("Защита контента была включена во время экспорта");
             } catch (Throwable e) {
-                FileLog.e("Unable to create Agram HTML export", e);
-                finishError("Не удалось создать HTML-архив");
+                FileLog.e("Unable to create Agram chat export", e);
+                finishError("Не удалось создать файл экспорта");
             }
+        }
+
+        private void startPdfRender(File htmlFile, int messageCount, int deletedCount) {
+            AgramHtmlPdfRenderer.RenderTask task = AgramHtmlPdfRenderer.render(
+                    htmlFile, outputFile, new AgramHtmlPdfRenderer.Callback() {
+                        @Override
+                        public void onSuccess() {
+                            exportQueue.postRunnable(() -> {
+                                pdfRenderTask = null;
+                                if (!completed.get()) {
+                                    completeOutput(messageCount, deletedCount);
+                                }
+                            });
+                        }
+
+                        @Override
+                        public void onError(String message) {
+                            exportQueue.postRunnable(() -> {
+                                pdfRenderTask = null;
+                                if (completed.get()) {
+                                    return;
+                                }
+                                if (cancelled.get()) {
+                                    finishCancelled();
+                                } else {
+                                    finishError(TextUtils.isEmpty(message)
+                                            ? "Не удалось сформировать PDF"
+                                            : message);
+                                }
+                            });
+                        }
+                    });
+            if (task == null) {
+                finishError("Не удалось запустить формирование PDF");
+                return;
+            }
+            pdfRenderTask = task;
+            if (cancelled.get() || completed.get()) {
+                task.cancel();
+            }
+        }
+
+        private void completeOutput(int messageCount, int deletedCount) {
+            if (completed.get()) {
+                return;
+            }
+            if (cancelled.get()) {
+                finishCancelled();
+                return;
+            }
+            if (outputFile == null || !outputFile.isFile() || outputFile.length() == 0) {
+                finishError("Не удалось создать файл экспорта");
+                return;
+            }
+            if (!isSessionValid()) {
+                finishError("Сессия или контейнер изменились во время экспорта");
+                return;
+            }
+            if (!areSourceDialogsExportable()) {
+                finishError("Защита контента была включена во время экспорта");
+                return;
+            }
+            deleteRecursively(stageDirectory);
+            stageDirectory = null;
+            finishSuccess(outputFile, messageCount, deletedCount);
         }
 
         private int queryCount(String sql) {
@@ -826,7 +929,7 @@ public final class AgramChatExportManager {
             }
         }
 
-        private void writeHtml(int messageCount, int deletedCount) throws IOException {
+        private File writeHtml(int messageCount, int deletedCount) throws IOException {
             File html = new File(stageDirectory, "messages.html");
             SimpleDateFormat dayFormat = new SimpleDateFormat("dd.MM.yyyy", Locale.getDefault());
             SimpleDateFormat dayKeyFormat = new SimpleDateFormat("yyyy-MM-dd", Locale.US);
@@ -884,13 +987,15 @@ public final class AgramChatExportManager {
                                     timeFormat, fullFormat);
                             rendered++;
                             if ((rendered & 127) == 0) {
-                                notifyProgress(rendered, messageCount, "Формирование HTML");
+                                notifyProgress(rendered, messageCount,
+                                        LocaleController.getString(R.string.AGramExportStageHtml));
                             }
                         }
                     }
                 }
                 writer.write("</div>\n</div>\n</body>\n</html>\n");
             }
+            return html;
         }
 
         private String buildSubtitle(int messageCount, int deletedCount) {
@@ -1059,12 +1164,16 @@ public final class AgramChatExportManager {
         }
 
         private void cancel() {
-            if (!cancelled.compareAndSet(false, true)) {
+            if (completed.get() || !cancelled.compareAndSet(false, true)) {
                 return;
             }
             int requestId = currentRequestId;
             if (requestId != 0) {
                 ConnectionsManager.getInstance(account).cancelRequest(requestId, true);
+            }
+            AgramHtmlPdfRenderer.RenderTask renderTask = pdfRenderTask;
+            if (renderTask != null) {
+                renderTask.cancel();
             }
             exportQueue.postRunnable(this::finishCancelled);
         }
@@ -1079,7 +1188,7 @@ public final class AgramChatExportManager {
                 }
                 // Treat missing peer metadata as protected. Without the authoritative local peer
                 // object we cannot prove that noforwards is disabled, especially at the final
-                // post-ZIP recheck where exporting must fail closed.
+                // post-output recheck where exporting must fail closed.
                 if (DialogObject.isUserDialog(sourceDialogId)) {
                     if (controller.getUser(sourceDialogId) == null
                             || controller.getUserFull(sourceDialogId) == null
@@ -1160,6 +1269,11 @@ public final class AgramChatExportManager {
         }
 
         private void closeAndCleanup(boolean deleteOutput) {
+            AgramHtmlPdfRenderer.RenderTask renderTask = pdfRenderTask;
+            pdfRenderTask = null;
+            if (renderTask != null) {
+                renderTask.cancel();
+            }
             try {
                 if (database != null) {
                     database.close();
