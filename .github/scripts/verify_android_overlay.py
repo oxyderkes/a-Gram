@@ -29,6 +29,8 @@ secure_store = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramSec
 push_controller = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramPushController.java")
 network_controller = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramNetworkController.java")
 deleted_media_store = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramDeletedMediaStore.java")
+chat_export = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramChatExportManager.java")
+chat_export_style = read("TMessagesProj/src/main/assets/agram_export/style.css")
 messages_storage = read("TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java")
 file_loader = read("TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java")
 image_loader = read("TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java")
@@ -223,6 +225,60 @@ required_retention_guards = (
 for guard in required_retention_guards:
     if guard not in message_object:
         errors.append(f"ordinary-message retention safety guard is missing: {guard}")
+
+required_chat_export_guards = (
+    "DialogObject.isEncryptedDialog(sourceDialogId)",
+    "isPeerNoForwards(sourceDialogId)",
+    "MessageObject.canKeepDeletedOnServer(message, sourceDialogId)",
+    "getAgramDeletedMessagesForExportPage(",
+    "SQLiteDatabase.openOrCreateDatabase",
+    "PRIMARY KEY(source_dialog_id, mid)",
+    "getPathToMessage(message, false)",
+    "agram_chat_exports",
+    "new DispatchQueue(\"agramChatExport-\"",
+    "exportQueue.postRunnable",
+    "users.clear()",
+    "chats.clear()",
+    "page.hasError()",
+    "page.finished",
+    "page.nextCursor",
+    "mergeDialogId",
+    "areSourceDialogsExportable()",
+    "isSessionValid()",
+    "containerId",
+    "RETIRED_CONTAINERS",
+)
+for guard in required_chat_export_guards:
+    if guard not in chat_export:
+        errors.append(f"chat export safety/performance guard is missing: {guard}")
+if "AndroidUtilities.getSharingDirectory()" in chat_export:
+    errors.append("chat exports must not use the cross-container sharing directory")
+if "Utilities.globalQueue" in chat_export:
+    errors.append("chat export orchestration must use its own serial DispatchQueue")
+if 'loading=\\"lazy\\"' not in chat_export or 'loading=\\"eager\\"' in chat_export:
+    errors.append("chat export images must use native lazy loading")
+if not re.search(r"\.message\.deleted\s*\{[^}]*opacity:\s*\.?(?:40|4)\s*;", chat_export_style, re.DOTALL):
+    errors.append("deleted messages in HTML export must render at 40% opacity")
+if not re.search(
+    r'<cache-path\b(?=[^>]*\bname="agram_chat_exports")(?=[^>]*\bpath="agram_chat_exports/")[^>]*/?>',
+    provider_paths,
+):
+    errors.append("FileProvider must expose only the dedicated chat-export cache subtree")
+if "AgramChatExportManager.purgeContainerCache(id)" not in container_manager:
+    errors.append("container removal must purge its share-ready chat exports")
+if not all(
+    guard in chat_activity
+    for guard in (
+        "canOfferAgramExport()",
+        "currentEncryptedChat != null",
+        "isPeerNoForwards()",
+        "userInfo != null",
+        "showAgramExportParticipantPicker()",
+        "pickAgramExportDateRange(",
+        "AgramChatExportManager.start(currentAccount, dialog_id, mergeDialogId,",
+    )
+):
+    errors.append("chat export UI must retain its scope, date and protected-chat guards")
 
 required_deleted_media_store_guards = (
     "deleted_media",

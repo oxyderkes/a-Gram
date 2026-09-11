@@ -364,6 +364,7 @@ public final class AgramContainerManager {
         // already be validating the current container through this manager. Invalidation is
         // installed first inside purgeContainer, so after the barrier no worker can recreate it.
         AgramDeletedMediaStore.purgeContainer(account, id);
+        AgramChatExportManager.purgeContainerCache(id);
 
         synchronized (sync) {
             if (!TextUtils.equals(id, preferences.getString(SLOT_PREFIX + account, null))) {

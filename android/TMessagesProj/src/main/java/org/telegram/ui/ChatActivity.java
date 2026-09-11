@@ -135,6 +135,7 @@ import com.google.zxing.common.detector.MathUtils;
 
 import org.telegram.PhoneFormat.PhoneFormat;
 import org.telegram.messenger.AccountInstance;
+import org.telegram.messenger.AgramChatExportManager;
 import org.telegram.messenger.AgramContainerManager;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ApplicationLoader;
@@ -627,6 +628,9 @@ public class ChatActivity extends BaseFragment implements
     private boolean scrollingChatListView;
     private boolean checkTextureViewPosition;
     private boolean searchingForUser;
+    private boolean agramSelectingExportUser;
+    private AgramChatExportManager.ExportTask agramExportTask;
+    private AlertDialog agramExportProgressDialog;
     private TLRPC.User searchingUserMessages;
     private TLRPC.Chat searchingChatMessages;
     public static boolean scrolling;
@@ -1688,6 +1692,7 @@ public class ChatActivity extends BaseFragment implements
     private final static int charge_fee = 72;
 
     private final static int chat_menu_topic_create = 73;
+    private final static int agram_export = 75;
 
     private final static int id_chat_compose_panel = 1000;
 
@@ -3361,6 +3366,11 @@ public class ChatActivity extends BaseFragment implements
     @Override
     public void onFragmentDestroy() {
         super.onFragmentDestroy();
+        if (agramExportTask != null) {
+            agramExportTask.cancel();
+            agramExportTask = null;
+        }
+        agramExportProgressDialog = null;
         if (messageMetricsView != null) {
             messageMetricsView.finish();
         }
@@ -3971,6 +3981,8 @@ public class ChatActivity extends BaseFragment implements
                     getSendMessagesHelper().sendMessage(SendMessagesHelper.SendMessageParams.of("/settings", dialog_id, null, null, null, false, null, null, null, true, 0, 0, null, false));
                 } else if (id == search) {
                     openSearchWithText(isSupportedTags() ? "" : null);
+                } else if (id == agram_export) {
+                    showAgramExportMenu();
                 } else if (id == translate) {
                     getMessagesController().getTranslateController().setHideTranslateDialog(getDialogId(), false, true);
                     if (!getMessagesController().getTranslateController().toggleTranslatingDialog(getDialogId(), true)) {
@@ -4421,6 +4433,9 @@ public class ChatActivity extends BaseFragment implements
 
             if (searchItem != null) {
                 headerItem.lazilyAddSubItem(search, R.drawable.msg_search, LocaleController.getString(R.string.Search));
+            }
+            if (canOfferAgramExport()) {
+                headerItem.lazilyAddSubItem(agram_export, R.drawable.msg_share, getString(R.string.AGramExportChat));
             }
             if (ChatObject.isBoostSupported(currentChat) && (getUserConfig().isPremium() || ChatObject.isBoosted(chatInfo) || ChatObject.hasAdminRights(currentChat))) {
                 RLottieDrawable drawable = new RLottieDrawable(R.raw.boosts, "" + R.raw.boosts, dp(24), dp(24));
@@ -7344,7 +7359,13 @@ public class ChatActivity extends BaseFragment implements
             } else if (object instanceof TLRPC.Chat) {
                 TLRPC.Chat chat = (TLRPC.Chat) object;
                 if (searchingForUser && searchContainer != null && searchContainer.getVisibility() == View.VISIBLE) {
-                    searchUserMessages(null, chat);
+                    if (agramSelectingExportUser) {
+                        agramSelectingExportUser = false;
+                        actionBar.closeSearchField();
+                        showAgramExportRangeChoice(-chat.id);
+                    } else {
+                        searchUserMessages(null, chat);
+                    }
                 } else {
                     String username = ChatObject.getPublicUsername(chat);
                     if (username != null) {
@@ -7354,7 +7375,13 @@ public class ChatActivity extends BaseFragment implements
             } else if (object instanceof TLRPC.User) {
                 TLRPC.User user = (TLRPC.User) object;
                 if (searchingForUser && searchContainer != null && searchContainer.getVisibility() == View.VISIBLE) {
-                    searchUserMessages(user, null);
+                    if (agramSelectingExportUser) {
+                        agramSelectingExportUser = false;
+                        actionBar.closeSearchField();
+                        showAgramExportRangeChoice(user.id);
+                    } else {
+                        searchUserMessages(user, null);
+                    }
                 } else {
                     if (UserObject.getPublicUsername(user) != null) {
                         chatActivityEnterView.replaceWithText(start, len, "@" + UserObject.getPublicUsername(user) + " ", false);
@@ -38661,6 +38688,7 @@ public class ChatActivity extends BaseFragment implements
         @Override
         public void onSearchCollapse() {
             searching = false;
+            agramSelectingExportUser = false;
             updatePagedownButtonVisibility(true);
             updateSearchUpDownButtonVisibility(true);
             if (searchCalendarButton != null) {
@@ -45020,6 +45048,242 @@ public class ChatActivity extends BaseFragment implements
                 progress.init();
             }
         }
+    }
+
+    private boolean canOfferAgramExport() {
+        if (currentEncryptedChat != null || chatMode != MODE_DEFAULT || isTopic || isPeerNoForwards()) {
+            return false;
+        }
+        if (mergeDialogId != 0) {
+            TLRPC.Chat mergedSource = getMessagesController().getChat(-mergeDialogId);
+            if (mergedSource == null || mergedSource.noforwards
+                    || getMessagesController().isPeerNoForwards(mergeDialogId)) {
+                return false;
+            }
+        }
+        if (currentUser != null) {
+            return userInfo != null && !currentUser.self && currentUser.id != UserObject.VERIFY;
+        }
+        return currentChat != null && (!ChatObject.isChannel(currentChat) || currentChat.megagroup);
+    }
+
+    private void showAgramExportMenu() {
+        if (getParentActivity() == null) {
+            return;
+        }
+        if (!canOfferAgramExport()) {
+            showAgramExportError(getString(R.string.AGramExportProtectedUnavailable));
+            return;
+        }
+        if (currentUser != null) {
+            showAgramExportRangeChoice(0);
+            return;
+        }
+        new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                .setTitle(getString(R.string.AGramExportChat))
+                .setMessage(getString(R.string.AGramExportIncludesDeleted))
+                .setItems(new CharSequence[]{
+                        getString(R.string.AGramExportWholeChat),
+                        getString(R.string.AGramExportParticipant)
+                }, (dialog, which) -> {
+                    if (which == 0) {
+                        showAgramExportRangeChoice(0);
+                    } else {
+                        showAgramExportParticipantPicker();
+                    }
+                })
+                .setNegativeButton(getString(R.string.Cancel), null)
+                .show();
+    }
+
+    private void showAgramExportParticipantPicker() {
+        if (getParentActivity() == null) {
+            return;
+        }
+        agramSelectingExportUser = true;
+        openSearchWithText("");
+        if (searchUserButton == null) {
+            agramSelectingExportUser = false;
+            actionBar.closeSearchField();
+            showAgramExportError(getString(R.string.AGramExportParticipantUnavailable));
+            return;
+        }
+        searchUserButton.callOnClick();
+        if (searchItem != null) {
+            searchItem.setSearchFieldHint(getString(R.string.AGramExportSelectParticipant));
+        }
+    }
+
+    private void showAgramExportRangeChoice(long senderId) {
+        if (getParentActivity() == null) {
+            return;
+        }
+        String title = senderId == 0
+                ? (currentUser != null ? getString(R.string.AGramExportPrivateDialog) : getString(R.string.AGramExportWholeChat))
+                : getString(R.string.AGramExportParticipant);
+        new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                .setTitle(title)
+                .setMessage(getString(R.string.AGramExportIncludesDeleted))
+                .setItems(new CharSequence[]{
+                        getString(R.string.AGramExportAllTime),
+                        getString(R.string.AGramExportDateRange)
+                }, (dialog, which) -> {
+                    if (which == 0) {
+                        startAgramExport(senderId, 0, 0);
+                    } else {
+                        pickAgramExportDateRange(senderId);
+                    }
+                })
+                .setNegativeButton(getString(R.string.Cancel), null)
+                .show();
+    }
+
+    private void pickAgramExportDateRange(long senderId) {
+        Activity activity = getParentActivity();
+        if (activity == null) {
+            return;
+        }
+        Calendar suggestedStart = Calendar.getInstance();
+        suggestedStart.add(Calendar.MONTH, -1);
+        DatePickerDialog startPicker = new DatePickerDialog(activity, (view, year, month, dayOfMonth) -> {
+            Calendar start = Calendar.getInstance();
+            start.clear();
+            start.set(year, month, dayOfMonth, 0, 0, 0);
+
+            Calendar suggestedEnd = Calendar.getInstance();
+            DatePickerDialog endPicker = new DatePickerDialog(activity, (endView, endYear, endMonth, endDay) -> {
+                Calendar end = Calendar.getInstance();
+                end.clear();
+                end.set(endYear, endMonth, endDay, 23, 59, 59);
+                if (end.before(start)) {
+                    showAgramExportError(getString(R.string.AGramExportInvalidDateRange));
+                    return;
+                }
+                startAgramExport(senderId, (int) (start.getTimeInMillis() / 1000L), (int) (end.getTimeInMillis() / 1000L));
+            }, suggestedEnd.get(Calendar.YEAR), suggestedEnd.get(Calendar.MONTH), suggestedEnd.get(Calendar.DAY_OF_MONTH));
+            endPicker.setTitle(getString(R.string.AGramExportPickEnd));
+            endPicker.getDatePicker().setMinDate(start.getTimeInMillis());
+            endPicker.getDatePicker().setMaxDate(System.currentTimeMillis());
+            endPicker.show();
+        }, suggestedStart.get(Calendar.YEAR), suggestedStart.get(Calendar.MONTH), suggestedStart.get(Calendar.DAY_OF_MONTH));
+        Calendar telegramLaunch = Calendar.getInstance();
+        telegramLaunch.clear();
+        telegramLaunch.set(2013, Calendar.JANUARY, 1, 0, 0, 0);
+        startPicker.setTitle(getString(R.string.AGramExportPickStart));
+        startPicker.getDatePicker().setMinDate(telegramLaunch.getTimeInMillis());
+        startPicker.getDatePicker().setMaxDate(System.currentTimeMillis());
+        startPicker.show();
+    }
+
+    private String getAgramExportTitle() {
+        if (currentChat != null && !TextUtils.isEmpty(currentChat.title)) {
+            return currentChat.title;
+        }
+        if (currentUser != null) {
+            return UserObject.getUserName(currentUser);
+        }
+        return getString(R.string.AGramExportChat);
+    }
+
+    private void startAgramExport(long senderId, int minDateSec, int maxDateSec) {
+        if (!canOfferAgramExport() || getParentActivity() == null) {
+            showAgramExportError(getString(R.string.AGramExportProtectedUnavailable));
+            return;
+        }
+        if (agramExportTask != null) {
+            return;
+        }
+        agramExportProgressDialog = new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                .setTitle(getString(R.string.AGramExportPreparing))
+                .setMessage(getString(R.string.AGramExportStarting))
+                .setNegativeButton(getString(R.string.Cancel), (dialog, which) -> {
+                    if (agramExportTask != null) {
+                        agramExportTask.cancel();
+                        agramExportTask = null;
+                    }
+                    agramExportProgressDialog = null;
+                })
+                .create();
+        showDialog(agramExportProgressDialog);
+        agramExportTask = AgramChatExportManager.start(currentAccount, dialog_id, mergeDialogId,
+                getAgramExportTitle(), senderId, minDateSec, maxDateSec,
+                new AgramChatExportManager.Listener() {
+            @Override
+            public void onProgress(int processed, int total, String stage) {
+                if (agramExportProgressDialog == null) {
+                    return;
+                }
+                String progress = total > 0
+                        ? formatString(R.string.AGramExportProgressCount, processed, total)
+                        : formatString(R.string.AGramExportProgress, processed);
+                if (!TextUtils.isEmpty(stage)) {
+                    progress = stage + "\n" + progress;
+                }
+                agramExportProgressDialog.setMessage(progress);
+            }
+
+            @Override
+            public void onDone(File archive, int messageCount, int deletedCount) {
+                dismissAgramExportProgress();
+                if (getParentActivity() == null) {
+                    return;
+                }
+                new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                        .setTitle(getString(R.string.AGramExportDone))
+                        .setMessage(formatString(R.string.AGramExportDoneInfo, messageCount, deletedCount))
+                        .setPositiveButton(getString(R.string.AGramExportShare), (dialog, which) -> shareAgramExport(archive))
+                        .setNegativeButton(getString(R.string.Close), null)
+                        .show();
+            }
+
+            @Override
+            public void onError(String message) {
+                dismissAgramExportProgress();
+                showAgramExportError(TextUtils.isEmpty(message) ? getString(R.string.AGramExportFailed) : message);
+            }
+                });
+    }
+
+    private void dismissAgramExportProgress() {
+        agramExportTask = null;
+        if (agramExportProgressDialog != null) {
+            try {
+                agramExportProgressDialog.dismiss();
+            } catch (Exception ignore) {
+            }
+            agramExportProgressDialog = null;
+        }
+    }
+
+    private void shareAgramExport(File archive) {
+        Activity activity = getParentActivity();
+        if (activity == null || archive == null || !archive.exists()) {
+            showAgramExportError(getString(R.string.AGramExportFileMissing));
+            return;
+        }
+        try {
+            Uri uri = FileProvider.getUriForFile(activity, ApplicationLoader.getApplicationId() + ".provider", archive);
+            Intent send = new Intent(Intent.ACTION_SEND);
+            send.setType("application/zip");
+            send.putExtra(Intent.EXTRA_STREAM, uri);
+            send.setClipData(ClipData.newUri(activity.getContentResolver(), archive.getName(), uri));
+            send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            activity.startActivity(Intent.createChooser(send, getString(R.string.AGramExportShare)));
+        } catch (Exception e) {
+            FileLog.e(e);
+            showAgramExportError(getString(R.string.AGramExportFailed));
+        }
+    }
+
+    private void showAgramExportError(String message) {
+        if (getParentActivity() == null) {
+            return;
+        }
+        new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                .setTitle(getString(R.string.AGramExportFailed))
+                .setMessage(message)
+                .setPositiveButton(getString(R.string.OK), null)
+                .show();
     }
 
     public void didLongPressCopyButton(String text) {

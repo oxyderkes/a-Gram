@@ -272,4 +272,26 @@
     <string name="AGramDeletedOnServer">{DELETED}</string>
     <string name="AGramAccountFrozen">Аккаунт заморожен</string>
     <string name="AGramAccountBlocked">Заблокирован или сессия отозвана · локальный профиль</string>
+    <string name="AGramExportChat">Экспорт чата в HTML</string>
+    <string name="AGramExportPrivateDialog">Диалог двух сторон</string>
+    <string name="AGramExportWholeChat">Весь групповой чат</string>
+    <string name="AGramExportParticipant">Сообщения одного участника</string>
+    <string name="AGramExportAllTime">За всё время</string>
+    <string name="AGramExportDateRange">Выбрать диапазон дат</string>
+    <string name="AGramExportPickStart">Начальная дата</string>
+    <string name="AGramExportPickEnd">Конечная дата</string>
+    <string name="AGramExportSelectParticipant">Выберите участника</string>
+    <string name="AGramExportParticipantUnavailable">Для этого чата список участников недоступен.</string>
+    <string name="AGramExportIncludesDeleted">В HTML-архив всегда входят локально сохранённые удалённые сообщения и пометки удалённых аккаунтов.</string>
+    <string name="AGramExportProtectedUnavailable">Экспорт недоступен для секретных чатов, защищённого и исчезающего контента.</string>
+    <string name="AGramExportInvalidDateRange">Конечная дата не может быть раньше начальной.</string>
+    <string name="AGramExportPreparing">Подготовка HTML-архива</string>
+    <string name="AGramExportStarting">Чтение истории чата…</string>
+    <string name="AGramExportProgress">Обработано: %1$d</string>
+    <string name="AGramExportProgressCount">Обработано: %1$d из %2$d</string>
+    <string name="AGramExportDone">Экспорт готов</string>
+    <string name="AGramExportDoneInfo">Сообщений: %1$d\nЛокально сохранённых удалённых: %2$d</string>
+    <string name="AGramExportShare">Сохранить или поделиться</string>
+    <string name="AGramExportFailed">Не удалось экспортировать чат</string>
+    <string name="AGramExportFileMissing">Подготовленный архив больше недоступен.</string>
 </resources>

@@ -11230,4 +11230,26 @@
     <string name="AGramDeletedOnServer">{DELETED}</string>
     <string name="AGramAccountFrozen">Account frozen</string>
     <string name="AGramAccountBlocked">Blocked or session revoked · local profile</string>
+    <string name="AGramExportChat">Export chat to HTML</string>
+    <string name="AGramExportPrivateDialog">Two-sided private dialog</string>
+    <string name="AGramExportWholeChat">Entire group chat</string>
+    <string name="AGramExportParticipant">Messages from one participant</string>
+    <string name="AGramExportAllTime">All time</string>
+    <string name="AGramExportDateRange">Choose date range</string>
+    <string name="AGramExportPickStart">Start date</string>
+    <string name="AGramExportPickEnd">End date</string>
+    <string name="AGramExportSelectParticipant">Select a participant</string>
+    <string name="AGramExportParticipantUnavailable">The participant list is not available for this chat.</string>
+    <string name="AGramExportIncludesDeleted">The HTML archive always includes locally retained deleted messages and identifies deleted accounts.</string>
+    <string name="AGramExportProtectedUnavailable">Export is unavailable for secret chats and protected or disappearing content.</string>
+    <string name="AGramExportInvalidDateRange">The end date must not be earlier than the start date.</string>
+    <string name="AGramExportPreparing">Preparing HTML archive</string>
+    <string name="AGramExportStarting">Reading chat history…</string>
+    <string name="AGramExportProgress">Processed: %1$d</string>
+    <string name="AGramExportProgressCount">Processed: %1$d of %2$d</string>
+    <string name="AGramExportDone">Export ready</string>
+    <string name="AGramExportDoneInfo">Messages: %1$d\nLocally retained deleted messages: %2$d</string>
+    <string name="AGramExportShare">Save or share archive</string>
+    <string name="AGramExportFailed">Could not export chat</string>
+    <string name="AGramExportFileMissing">The prepared archive is no longer available.</string>
 </resources>
