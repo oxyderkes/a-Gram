@@ -5395,7 +5395,10 @@ public class NotificationsController extends BaseController implements Notificat
                         boolean setPhoto = false;
                         if (preview[0] && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && !((ActivityManager) ApplicationLoader.applicationContext.getSystemService(Context.ACTIVITY_SERVICE)).isLowRamDevice()) {
                             if (!waitingForPasscode && !messageObject.isSecretMedia() && (messageObject.type == MessageObject.TYPE_PHOTO || messageObject.isSticker())) {
-                                File attach = getFileLoader().getPathToMessage(messageObject.messageOwner);
+                                // Notification spoiler derivatives belong to ordinary cache. Do
+                                // not create sibling files inside the durable deleted-media store.
+                                File attach = FileLoader.getInstance(messageObject.currentAccount)
+                                        .getPathToMessageWithoutDeletedArchive(messageObject.messageOwner, false, true);
                                 File blurredAttach;
                                 if (attach.exists() && messageObject.hasMediaSpoilers()) {
                                     blurredAttach = new File(attach.getParentFile(), attach.getName() + ".blur.jpg");

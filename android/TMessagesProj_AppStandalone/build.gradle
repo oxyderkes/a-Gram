@@ -15,7 +15,6 @@ tasks.withType(JavaCompile).configureEach {
 repositories {
     mavenCentral()
     google()
-    maven { url 'https://raw.githubusercontent.com/guardianproject/gpmaven/master' }
 }
 
 configurations {

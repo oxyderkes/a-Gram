@@ -80,7 +80,7 @@ public final class AgramPushController {
         refreshSubscriptions();
     }
 
-    /** Reconnects the selected subscription after its proxy/Tor route changes. */
+    /** Reconnects the selected subscription after its direct/proxy route changes. */
     public void onNetworkRouteChanged(int account) {
         synchronized (sync) {
             stopSubscriptionLocked(account);
@@ -382,18 +382,6 @@ public final class AgramPushController {
         private RoutedConnection openConnection(URL url, AgramContainerManager.ContainerRecord record) throws IOException {
             if (AgramContainerManager.NETWORK_DIRECT.equals(record.proxyMode)) {
                 return new RoutedConnection(url.openConnection(), null, 0, null);
-            }
-            if (AgramContainerManager.NETWORK_TOR.equals(record.proxyMode)) {
-                int port = AgramTorManager.getInstance().getSocksPort();
-                if (port <= 0) {
-                    throw new IOException("Embedded Tor is not ready; push route stays fail-closed");
-                }
-                String isolationId = TextUtils.isEmpty(record.torIsolationId)
-                        ? "agram-account-" + account : record.torIsolationId;
-                Proxy proxy = new Proxy(Proxy.Type.SOCKS,
-                        InetSocketAddress.createUnresolved("127.0.0.1", port));
-                return new RoutedConnection(url.openConnection(proxy), "127.0.0.1", port,
-                        new PasswordAuthentication("<torS0X>0", isolationId.toCharArray()));
             }
             if (AgramContainerManager.NETWORK_PROXY.equals(record.proxyMode)
                     && TextUtils.isEmpty(record.proxySecret)

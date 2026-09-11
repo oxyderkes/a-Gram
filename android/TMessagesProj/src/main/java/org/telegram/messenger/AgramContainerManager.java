@@ -14,11 +14,19 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.File;
+import java.io.IOException;
+import java.io.FileDescriptor;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.TimeZone;
 import java.util.UUID;
 
@@ -40,7 +48,7 @@ public final class AgramContainerManager {
 
     public static final String NETWORK_DIRECT = "direct";
     public static final String NETWORK_PROXY = "custom";
-    public static final String NETWORK_TOR = "tor";
+    private static final String LEGACY_NETWORK_TOR = "tor";
     public static final String PUSH_DIRECT = "direct";
     public static final String PUSH_AGRAM = "agram";
     private static final String LEGACY_PUSH_UNIFIED = "unifiedpush";
@@ -58,7 +66,8 @@ public final class AgramContainerManager {
     private static final String METADATA_PREFIX = "metadata_";
     private static final String PUSH_INSTANCE_HASH_PREFIX = "push_instance_hash_";
     private static final String QUARANTINE_PREFIX = "quarantine_";
-    private static final int SCHEMA_VERSION = 6;
+    private static final String DELETION_INTENT_PREFIX = "deletion_intent_";
+    private static final int SCHEMA_VERSION = 7;
     private static final String LEGACY_DURESS_PREFS = "agram_duress_registry";
     private static final String LEGACY_DURESS_SCOPE = "agram_global_duress_v1";
     private static final String LEGACY_CODES_PURGED = "legacy_false_codes_purged_v2";
@@ -100,6 +109,7 @@ public final class AgramContainerManager {
     private AgramContainerManager() {
         preferences = ApplicationLoader.applicationContext.getSharedPreferences(REGISTRY, Context.MODE_PRIVATE);
         purgeLegacyFalseCodes();
+        sweepContainerTombstones();
     }
 
     public ContainerRecord ensureContainer(int account) {
@@ -329,13 +339,57 @@ public final class AgramContainerManager {
     }
 
     public void deleteContainer(int account) {
+        final String id;
         synchronized (sync) {
-            String id = preferences.getString(SLOT_PREFIX + account, null);
+            id = preferences.getString(SLOT_PREFIX + account, null);
             if (TextUtils.isEmpty(id)) {
                 return;
             }
-            // Delete the wrapping key first. Any residual ciphertext becomes
-            // irrecoverable before best-effort file cleanup starts.
+            File containerDirectory = getValidatedContainerChild(id, false);
+            File tombstone = getValidatedContainerChild(".deleting-" + id, true);
+            if (containerDirectory == null || tombstone == null) {
+                FileLog.e("Refusing unsafe Agram container deletion for id=" + id);
+                return;
+            }
+            // Persist the exact validated UUID before touching the directory. This is the
+            // durable recovery point if the process dies after rename, or if directory fsync
+            // is unavailable on a particular Android filesystem.
+            if (!preferences.edit().putBoolean(DELETION_INTENT_PREFIX + id, true).commit()) {
+                FileLog.e("Unable to persist Agram container deletion intent for " + id);
+                return;
+            }
+        }
+
+        // Do not hold the manager lock while waiting for archive I/O: an in-flight worker may
+        // already be validating the current container through this manager. Invalidation is
+        // installed first inside purgeContainer, so after the barrier no worker can recreate it.
+        AgramDeletedMediaStore.purgeContainer(account, id);
+
+        synchronized (sync) {
+            if (!TextUtils.equals(id, preferences.getString(SLOT_PREFIX + account, null))) {
+                return;
+            }
+            File containerDirectory = getValidatedContainerChild(id, false);
+            File tombstone = getValidatedContainerChild(".deleting-" + id, true);
+            if (containerDirectory == null || tombstone == null) {
+                FileLog.e("Refusing unsafe Agram container deletion for id=" + id);
+                return;
+            }
+            if (containerDirectory.exists()) {
+                if (tombstone.exists()) {
+                    FileLog.e("Refusing Agram container deletion because tombstone exists " + tombstone);
+                    return;
+                }
+                try {
+                    moveAtomically(containerDirectory, tombstone);
+                    syncDirectory(tombstone.getParentFile());
+                } catch (Throwable e) {
+                    FileLog.e("Unable to tombstone Agram container " + containerDirectory, e);
+                    return;
+                }
+            }
+            // Retire the wrapping key after the whole container has a durable deletion name.
+            // Plain archived media remains inside that tombstone and is retried until removed.
             AgramSecureStore.deleteKey(id);
             preferences.edit()
                     .remove(SLOT_PREFIX + account)
@@ -344,7 +398,11 @@ public final class AgramContainerManager {
                     .remove(QUARANTINE_PREFIX + id)
                     .commit();
             recordCache.remove(account);
-            Utilities.globalQueue.postRunnable(() -> deleteRecursively(getContainerDirectory(id)));
+            if (tombstone.exists()) {
+                Utilities.globalQueue.postRunnable(() -> deleteTombstone(tombstone));
+            } else {
+                clearDeletionIntent(id);
+            }
         }
     }
 
@@ -446,8 +504,6 @@ public final class AgramContainerManager {
         public String proxyUsername;
         public String proxyPassword;
         public String proxySecret;
-        public String torIsolationId;
-        public long torIsolationChangedAt;
         public String pushMode;
         public String agramPushInstance;
         public String agramPushEndpoint;
@@ -482,6 +538,7 @@ public final class AgramContainerManager {
             ContainerRecord record = ensureContainer(account);
             record.proxyEnabled = enabled && !TextUtils.isEmpty(address);
             record.proxyMode = record.proxyEnabled ? NETWORK_PROXY : NETWORK_DIRECT;
+            record.killSwitch = record.proxyEnabled && record.killSwitch;
             record.proxyAddress = safe(address);
             record.proxyPort = port > 0 && port <= 65535 ? port : 1080;
             record.proxyUsername = safe(username);
@@ -511,18 +568,17 @@ public final class AgramContainerManager {
      */
     public void publishProxyForSelectedContainer(int account) {
         ProxyProfile proxy = getProxyProfile(account);
-        boolean tor = NETWORK_TOR.equals(proxy.mode);
-        int torPort = tor ? AgramTorManager.getInstance().getSocksPort() : 0;
-        boolean enabled = proxy.enabled && (!tor || torPort > 0);
+        boolean enabled = proxy.enabled
+                && NETWORK_PROXY.equals(proxy.mode)
+                && !TextUtils.isEmpty(proxy.address);
         ApplicationLoader.applicationContext.getSharedPreferences("mainconfig", Context.MODE_PRIVATE)
                 .edit()
                 .putBoolean("proxy_enabled", enabled)
-                .putString("proxy_ip", enabled ? proxy.address : "")
-                .putInt("proxy_port", tor && torPort > 0 ? torPort : proxy.port)
-                .putString("proxy_user", tor && enabled ? "<torS0X>0" : proxy.username)
-                .putString("proxy_pass", tor && enabled
-                        ? ensureContainer(account).torIsolationId : proxy.password)
-                .putString("proxy_secret", tor ? "" : proxy.secret)
+                .putString("proxy_ip", proxy.address)
+                .putInt("proxy_port", proxy.port)
+                .putString("proxy_user", proxy.username)
+                .putString("proxy_pass", proxy.password)
+                .putString("proxy_secret", proxy.secret)
                 .commit();
     }
 
@@ -555,30 +611,14 @@ public final class AgramContainerManager {
             ContainerRecord record = ensureContainer(account);
             String normalizedMode = normalizeNetworkMode(mode);
             record.proxyMode = normalizedMode;
-            // Embedded Tor is always fail-closed. It must never silently fall
-            // back to a direct MTProto connection while Tor is bootstrapping.
-            record.killSwitch = NETWORK_TOR.equals(normalizedMode)
-                    || (killSwitch && !NETWORK_DIRECT.equals(normalizedMode));
-            record.proxyEnabled = !NETWORK_DIRECT.equals(normalizedMode);
-            record.proxyAddress = NETWORK_TOR.equals(normalizedMode) ? "127.0.0.1" : safe(address).trim();
-            // The embedded daemon allocates its listener dynamically. Zero is
-            // a persisted marker, never a network fallback port.
-            record.proxyPort = NETWORK_TOR.equals(normalizedMode) ? 0 : normalizePort(port);
-            record.proxyUsername = NETWORK_TOR.equals(normalizedMode) ? "" : safe(username);
-            record.proxyPassword = NETWORK_TOR.equals(normalizedMode) ? "" : safe(password);
-            record.proxySecret = NETWORK_TOR.equals(normalizedMode) ? "" : safe(secret);
+            record.killSwitch = killSwitch && NETWORK_PROXY.equals(normalizedMode);
+            record.proxyEnabled = NETWORK_PROXY.equals(normalizedMode);
+            record.proxyAddress = safe(address).trim();
+            record.proxyPort = normalizePort(port);
+            record.proxyUsername = safe(username);
+            record.proxyPassword = safe(password);
+            record.proxySecret = safe(secret);
             saveRecord(record);
-        }
-    }
-
-    /** Rotates only this container's SOCKS-auth isolation group. */
-    public String rotateTorIsolation(int account) {
-        synchronized (sync) {
-            ContainerRecord record = ensureContainer(account);
-            record.torIsolationId = newTorIsolationId();
-            record.torIsolationChangedAt = System.currentTimeMillis();
-            saveRecord(record);
-            return record.torIsolationId;
         }
     }
 
@@ -662,8 +702,6 @@ public final class AgramContainerManager {
         record.proxyUsername = "";
         record.proxyPassword = "";
         record.proxySecret = "";
-        record.torIsolationId = newTorIsolationId();
-        record.torIsolationChangedAt = record.createdAt;
         record.proxyEnabled = false;
         record.proxyMode = NETWORK_DIRECT;
         record.killSwitch = false;
@@ -729,7 +767,8 @@ public final class AgramContainerManager {
             if (!expectedHash.equals(preferences.getString(hashKey, ""))) {
                 preferences.edit().putString(hashKey, expectedHash).apply();
             }
-            if (storedSchema < SCHEMA_VERSION || json.has("decoy_codes")) {
+            if (storedSchema < SCHEMA_VERSION || json.has("decoy_codes")
+                    || LEGACY_NETWORK_TOR.equals(json.optString("proxy_mode", ""))) {
                 // Version 2 removes legacy false-code hashes from encrypted
                 // metadata instead of only hiding their settings UI.
                 saveRecord(record);
@@ -770,7 +809,6 @@ public final class AgramContainerManager {
         record.proxyUsername = "";
         record.proxyPassword = "";
         record.proxySecret = "";
-        record.torIsolationId = "";
         record.pushMode = PUSH_DIRECT;
         record.agramPushInstance = "";
         record.agramPushEndpoint = "";
@@ -838,8 +876,6 @@ public final class AgramContainerManager {
         json.put("proxy_username", record.proxyUsername);
         json.put("proxy_password", record.proxyPassword);
         json.put("proxy_secret", record.proxySecret);
-        json.put("tor_isolation_id", record.torIsolationId);
-        json.put("tor_isolation_changed_at", record.torIsolationChangedAt);
         json.put("push_mode", record.pushMode);
         json.put("agram_push_instance", record.agramPushInstance);
         json.put("agram_push_endpoint", record.agramPushEndpoint);
@@ -882,19 +918,31 @@ public final class AgramContainerManager {
         record.clientLanguageCode = normalizeLanguage(json.optString("client_language", record.languageCode));
         record.fixedTimezone = json.optBoolean("fixed_timezone", false);
         record.timezoneOffset = json.optInt("timezone_offset", systemTimezoneOffset());
-        record.proxyMode = json.optString("proxy_mode", "direct");
-        record.killSwitch = json.optBoolean("kill_switch", false);
-        record.proxyEnabled = json.optBoolean("proxy_enabled", false);
+        String storedProxyMode = json.optString("proxy_mode", NETWORK_DIRECT);
+        boolean migratedFromTor = LEGACY_NETWORK_TOR.equals(storedProxyMode);
+        record.proxyMode = normalizeNetworkMode(storedProxyMode);
+        record.killSwitch = NETWORK_PROXY.equals(record.proxyMode)
+                && json.optBoolean("kill_switch", false);
+        record.proxyEnabled = NETWORK_PROXY.equals(record.proxyMode)
+                && json.optBoolean("proxy_enabled", false);
         record.proxyAddress = json.optString("proxy_address", "");
         record.proxyPort = json.optInt("proxy_port", 1080);
         record.proxyUsername = json.optString("proxy_username", "");
         record.proxyPassword = json.optString("proxy_password", "");
         record.proxySecret = json.optString("proxy_secret", "");
-        record.torIsolationId = json.optString("tor_isolation_id", "");
-        if (TextUtils.isEmpty(record.torIsolationId)) {
-            record.torIsolationId = newTorIsolationId();
+        if (migratedFromTor) {
+            // Embedded Tor was removed in schema 7. Retire only its route
+            // metadata; the container id, Keystore key and Telegram session
+            // remain untouched so an in-place update cannot log the user out.
+            record.proxyMode = NETWORK_DIRECT;
+            record.killSwitch = false;
+            record.proxyEnabled = false;
+            record.proxyAddress = "";
+            record.proxyPort = 1080;
+            record.proxyUsername = "";
+            record.proxyPassword = "";
+            record.proxySecret = "";
         }
-        record.torIsolationChangedAt = json.optLong("tor_isolation_changed_at", record.createdAt);
         String storedPushMode = json.optString("push_mode", PUSH_AGRAM);
         record.pushMode = PUSH_DIRECT.equals(storedPushMode) ? PUSH_DIRECT : PUSH_AGRAM;
         record.agramPushInstance = json.optString("agram_push_instance",
@@ -1060,10 +1108,7 @@ public final class AgramContainerManager {
     }
 
     private static String normalizeNetworkMode(String value) {
-        if (NETWORK_PROXY.equals(value) || NETWORK_TOR.equals(value)) {
-            return value;
-        }
-        return NETWORK_DIRECT;
+        return NETWORK_PROXY.equals(value) ? NETWORK_PROXY : NETWORK_DIRECT;
     }
 
     private static int normalizePort(int value) {
@@ -1077,6 +1122,17 @@ public final class AgramContainerManager {
         try {
             UUID.fromString(value);
             return true;
+        } catch (IllegalArgumentException ignore) {
+            return false;
+        }
+    }
+
+    private static boolean isStrictUuid(String value) {
+        if (TextUtils.isEmpty(value)) {
+            return false;
+        }
+        try {
+            return UUID.fromString(value).toString().equals(value.toLowerCase(Locale.US));
         } catch (IllegalArgumentException ignore) {
             return false;
         }
@@ -1116,12 +1172,6 @@ public final class AgramContainerManager {
         return value == null ? "" : value;
     }
 
-    private static String newTorIsolationId() {
-        // Tor's IsolateSOCKSAuth groups streams by SOCKS username/password.
-        // This opaque value is stored only inside the encrypted container record.
-        return "agram-" + UUID.randomUUID().toString().replace("-", "");
-    }
-
     private static String androidMajorVersion() {
         String release = Build.VERSION.RELEASE;
         if (TextUtils.isEmpty(release)) {
@@ -1135,14 +1185,221 @@ public final class AgramContainerManager {
         return new File(ApplicationLoader.applicationContext.getFilesDir(), "agram_containers/" + id);
     }
 
-    private static void deleteRecursively(File file) {
+    private static File getValidatedContainerChild(String name, boolean tombstone) {
+        String id = tombstone && name != null && name.startsWith(".deleting-")
+                ? name.substring(".deleting-".length()) : name;
+        if (!isStrictUuid(id) || tombstone != (name != null && name.startsWith(".deleting-"))) {
+            return null;
+        }
+        try {
+            File root = new File(ApplicationLoader.applicationContext.getFilesDir(),
+                    "agram_containers").getCanonicalFile();
+            File child = new File(root, name).getCanonicalFile();
+            return root.equals(child.getParentFile()) ? child : null;
+        } catch (IOException e) {
+            FileLog.e("Unable to validate Agram container path", e);
+            return null;
+        }
+    }
+
+    private static void moveAtomically(File source, File destination) throws IOException {
+        try {
+            Files.move(source.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(source.toPath(), destination.toPath());
+        }
+    }
+
+    private void sweepContainerTombstones() {
+        Set<String> deletionIds = new HashSet<>();
+        for (Map.Entry<String, ?> preference : preferences.getAll().entrySet()) {
+            String key = preference.getKey();
+            if (key != null && key.startsWith(DELETION_INTENT_PREFIX)) {
+                String id = key.substring(DELETION_INTENT_PREFIX.length());
+                if (isStrictUuid(id) && Boolean.TRUE.equals(preference.getValue())) {
+                    deletionIds.add(id);
+                }
+            }
+        }
+        File root;
+        try {
+            root = new File(ApplicationLoader.applicationContext.getFilesDir(),
+                    "agram_containers").getCanonicalFile();
+        } catch (IOException e) {
+            FileLog.e("Unable to resolve Agram containers root", e);
+            return;
+        }
+        File[] children = root.listFiles();
+        if (children != null) {
+            for (File child : children) {
+                String name = child == null ? null : child.getName();
+                if (name == null || !name.startsWith(".deleting-")
+                        || !isStrictUuid(name.substring(".deleting-".length()))) {
+                    continue;
+                }
+                String id = name.substring(".deleting-".length());
+                // Upgrade tombstones created by an older build to the durable intent protocol.
+                if (preferences.edit().putBoolean(DELETION_INTENT_PREFIX + id, true).commit()) {
+                    deletionIds.add(id);
+                }
+            }
+        }
+        for (String id : deletionIds) {
+            resumeContainerDeletion(id);
+        }
+    }
+
+    private void resumeContainerDeletion(String id) {
+        File containerDirectory = getValidatedContainerChild(id, false);
+        File tombstone = getValidatedContainerChild(".deleting-" + id, true);
+        if (containerDirectory == null || tombstone == null) {
+            FileLog.e("Refusing unsafe persisted Agram container deletion for id=" + id);
+            return;
+        }
+        if (containerDirectory.exists()) {
+            if (tombstone.exists()) {
+                // Never guess which duplicate tree is authoritative. Keep the durable intent
+                // and retry safely on a later startup after the existing tombstone is removed.
+                Utilities.globalQueue.postRunnable(() -> deleteTombstone(tombstone));
+                return;
+            }
+            try {
+                moveAtomically(containerDirectory, tombstone);
+                syncDirectory(tombstone.getParentFile());
+            } catch (Throwable e) {
+                FileLog.e("Unable to resume Agram container tombstoning " + containerDirectory, e);
+                return;
+            }
+        }
+        finalizeTombstonedContainer(id);
+        if (tombstone.exists()) {
+            Utilities.globalQueue.postRunnable(() -> deleteTombstone(tombstone));
+        } else {
+            clearDeletionIntent(id);
+        }
+    }
+
+    private void finalizeTombstonedContainer(String id) {
+        if (!isStrictUuid(id)) {
+            return;
+        }
+        SharedPreferences.Editor editor = preferences.edit();
+        for (int account = 0; account < UserConfig.MAX_ACCOUNT_COUNT; account++) {
+            if (TextUtils.equals(id, preferences.getString(SLOT_PREFIX + account, null))) {
+                editor.remove(SLOT_PREFIX + account);
+                recordCache.remove(account);
+            }
+        }
+        AgramSecureStore.deleteKey(id);
+        editor.remove(METADATA_PREFIX + id)
+                .remove(PUSH_INSTANCE_HASH_PREFIX + id)
+                .remove(QUARANTINE_PREFIX + id)
+                .commit();
+    }
+
+    private void deleteTombstone(File tombstone) {
+        File validated = tombstone == null ? null
+                : getValidatedContainerChild(tombstone.getName(), true);
+        if (validated == null || !validated.equals(tombstone)) {
+            FileLog.e("Refusing unsafe Agram tombstone deletion " + tombstone);
+            return;
+        }
+        deleteRecursively(validated, validated);
+        syncDirectory(validated.getParentFile());
+        if (validated.exists()) {
+            Utilities.globalQueue.postRunnable(() -> deleteTombstone(validated), 30_000);
+        } else {
+            String id = validated.getName().substring(".deleting-".length());
+            File original = getValidatedContainerChild(id, false);
+            if (original != null && original.exists()
+                    && preferences.getBoolean(DELETION_INTENT_PREFIX + id, false)) {
+                synchronized (sync) {
+                    resumeContainerDeletion(id);
+                }
+            } else {
+                clearDeletionIntent(id);
+            }
+        }
+    }
+
+    private void clearDeletionIntent(String id) {
+        if (!isStrictUuid(id)) {
+            return;
+        }
+        synchronized (sync) {
+            if (hasMappedSlot(id)) {
+                // A prior registry commit may have failed after the tombstone was made. Retry
+                // retiring the exact mapped UUID before dropping the only durable recovery hint.
+                finalizeTombstonedContainer(id);
+            }
+            File original = getValidatedContainerChild(id, false);
+            File tombstone = getValidatedContainerChild(".deleting-" + id, true);
+            if (hasMappedSlot(id) || (original != null && original.exists())
+                    || (tombstone != null && tombstone.exists())) {
+                Utilities.globalQueue.postRunnable(() -> {
+                    synchronized (sync) {
+                        resumeContainerDeletion(id);
+                    }
+                }, 30_000);
+                return;
+            }
+            if (!preferences.edit().remove(DELETION_INTENT_PREFIX + id).commit()) {
+                FileLog.e("Unable to clear Agram container deletion intent for " + id);
+            }
+        }
+    }
+
+    private boolean hasMappedSlot(String id) {
+        for (int account = 0; account < UserConfig.MAX_ACCOUNT_COUNT; account++) {
+            if (TextUtils.equals(id, preferences.getString(SLOT_PREFIX + account, null))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void syncDirectory(File directory) {
+        FileDescriptor descriptor = null;
+        try {
+            descriptor = android.system.Os.open(directory.getAbsolutePath(),
+                    android.system.OsConstants.O_RDONLY, 0);
+            android.system.Os.fsync(descriptor);
+        } catch (Throwable e) {
+            FileLog.e("Unable to fsync Agram container directory " + directory, e);
+        } finally {
+            if (descriptor != null) {
+                try {
+                    android.system.Os.close(descriptor);
+                } catch (Throwable e) {
+                    FileLog.e("Unable to close Agram container directory " + directory, e);
+                }
+            }
+        }
+    }
+
+    private static void deleteRecursively(File file, File validatedRoot) {
         if (file == null || !file.exists()) {
+            return;
+        }
+        try {
+            File canonical = file.getCanonicalFile();
+            String rootPath = validatedRoot.getCanonicalPath();
+            if (!canonical.equals(validatedRoot)
+                    && !canonical.getPath().startsWith(rootPath + File.separator)) {
+                // Do not follow a symlink or corrupt directory entry outside the tombstone.
+                if (Files.isSymbolicLink(file.toPath()) && !file.delete()) {
+                    FileLog.e("Unable to delete unsafe Agram tombstone link " + file);
+                }
+                return;
+            }
+        } catch (IOException e) {
+            FileLog.e("Unable to validate Agram tombstone child " + file, e);
             return;
         }
         File[] children = file.listFiles();
         if (children != null) {
             for (File child : children) {
-                deleteRecursively(child);
+                deleteRecursively(child, validatedRoot);
             }
         }
         if (!file.delete()) {

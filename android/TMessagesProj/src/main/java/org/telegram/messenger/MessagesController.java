@@ -16276,8 +16276,6 @@ public class MessagesController extends BaseController implements NotificationCe
         // that session. A later login in the freed engine slot receives a new
         // random container id, Keystore key, push instance and device profile.
         AgramContainerManager.getInstance().deleteContainer(currentAccount);
-        AgramSessionRouteController.getInstance().clear(currentAccount);
-        AgramTorManager.getInstance().stopIfUnused();
         SharedPrefsHelper.cleanupAccount(currentAccount);
 
         boolean shouldHandle = true;

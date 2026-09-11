@@ -1419,6 +1419,9 @@ public class MessagesStorage extends BaseController {
             SQLitePreparedStatement state6 = null;
             try {
                 ArrayList<Long> dialogsToCleanup = new ArrayList<>();
+                LongSparseArray<ArrayList<Integer>> archivedMessagesToPurge = new LongSparseArray<>();
+                LongSparseArray<long[]> archiveRetainedMessages = new LongSparseArray<>();
+                LongSparseArray<ArrayList<Integer>> exactArchivedMessagesToPurge = new LongSparseArray<>();
 
                 database.executeFast("DELETE FROM ephemeral_messages").stepThis().dispose();
                 database.executeFast("DELETE FROM poll_votes_mentions").stepThis().dispose();
@@ -1431,7 +1434,6 @@ public class MessagesStorage extends BaseController {
                 database.executeFast("DELETE FROM stickers_v2").stepThis().dispose();
                 database.executeFast("DELETE FROM stickersets2").stepThis().dispose();
                 database.executeFast("DELETE FROM messages_holes_topics").stepThis().dispose();
-                database.executeFast("DELETE FROM messages_topics").stepThis().dispose();
                 database.executeFast("DELETE FROM saved_dialogs").stepThis().dispose();
                 database.executeFast("DELETE FROM topics").stepThis().dispose();
                 database.executeFast("DELETE FROM media_holes_topics").stepThis().dispose();
@@ -1480,6 +1482,10 @@ public class MessagesStorage extends BaseController {
                     }
                     cursor.dispose();
                     if (messagesCount <= 2) {
+                        ArrayList<Integer> topicOnlyIds = getArchivePurgeTopicOnlyMessageIds(did);
+                        if (!topicOnlyIds.isEmpty()) {
+                            exactArchivedMessagesToPurge.put(did, topicOnlyIds);
+                        }
                         continue;
                     }
 
@@ -1488,6 +1494,9 @@ public class MessagesStorage extends BaseController {
                     if (cursor.next()) {
                         long last_mid_i = cursor.longValue(0);
                         long last_mid = cursor.longValue(1);
+                        archivedMessagesToPurge.put(did, getArchivePurgeMessageIds(
+                                did, true, last_mid_i, last_mid));
+                        archiveRetainedMessages.put(did, new long[]{last_mid_i, last_mid});
                         SQLiteCursor cursor2 = database.queryFinalized("SELECT data FROM messages_v2 WHERE uid = " + did + " AND mid IN (" + last_mid_i + "," + last_mid + ")");
                         try {
                             while (cursor2.next()) {
@@ -1522,11 +1531,30 @@ public class MessagesStorage extends BaseController {
                     cursor = null;
                 }
 
+                // Keep topic rows available until every archive plan above has captured the
+                // exact local deleted markers. The database clear still removes them all.
+                database.executeFast("DELETE FROM messages_topics").stepThis().dispose();
+
                 state5.dispose();
                 state6.dispose();
                 state5 = null;
                 state6 = null;
                 database.commitTransaction();
+                for (int i = 0; i < archivedMessagesToPurge.size(); i++) {
+                    long did = archivedMessagesToPurge.keyAt(i);
+                    long[] retained = archiveRetainedMessages.get(did);
+                    if (retained != null) {
+                        AgramDeletedMediaStore.purgeDialogExcept(currentAccount, did,
+                                archivedMessagesToPurge.valueAt(i), retained[0], retained[1]);
+                    }
+                }
+                for (int i = 0; i < exactArchivedMessagesToPurge.size(); i++) {
+                    long did = exactArchivedMessagesToPurge.keyAt(i);
+                    ArrayList<Integer> messageIds = exactArchivedMessagesToPurge.valueAt(i);
+                    for (int j = 0; j < messageIds.size(); j++) {
+                        AgramDeletedMediaStore.purgeMessage(currentAccount, did, messageIds.get(j));
+                    }
+                }
                 database.executeFast("PRAGMA journal_size_limit = 0").stepThis().dispose();
                 database.executeFast("VACUUM").stepThis().dispose();
                 database.executeFast("PRAGMA journal_size_limit = -1").stepThis().dispose();
@@ -2161,7 +2189,17 @@ public class MessagesStorage extends BaseController {
 
     public void removeTopic(long dialogId, long topicId) {
         storageQueue.postRunnable(() -> {
+            SQLiteCursor archiveCursor = null;
             try {
+                ArrayList<Integer> archiveMids = new ArrayList<>();
+                archiveCursor = database.queryFinalized(
+                        "SELECT mid FROM messages_topics WHERE uid = ? AND topic_id = ?",
+                        dialogId, topicId);
+                while (archiveCursor.next()) {
+                    archiveMids.add(archiveCursor.intValue(0));
+                }
+                archiveCursor.dispose();
+                archiveCursor = null;
                 database.executeFast(String.format(Locale.US, "DELETE FROM topics WHERE did = %d AND topic_id = %d", dialogId, topicId)).stepThis().dispose();
                 database.executeFast(String.format(Locale.US,
                     "DELETE FROM messages_v2 WHERE uid = %d AND mid IN (" +
@@ -2169,29 +2207,49 @@ public class MessagesStorage extends BaseController {
                             ")",
                     dialogId, dialogId, topicId)).stepThis().dispose();
                 database.executeFast(String.format(Locale.US, "DELETE FROM messages_topics WHERE uid = %d AND topic_id = %d", dialogId, topicId)).stepThis().dispose();
+                for (int i = 0; i < archiveMids.size(); i++) {
+                    AgramDeletedMediaStore.purgeMessage(currentAccount, dialogId, archiveMids.get(i));
+                }
             } catch (SQLiteException e) {
                 e.printStackTrace();
+            } finally {
+                if (archiveCursor != null) {
+                    archiveCursor.dispose();
+                }
             }
         });
     }
 
     public void removeTopics(long dialogId, ArrayList<Long> topicIds) {
         storageQueue.postRunnable(() -> {
+            SQLiteCursor archiveCursor = null;
             try {
                 String topics = TextUtils.join(", ", topicIds);
+                ArrayList<Integer> archiveMids = new ArrayList<>();
+                archiveCursor = database.queryFinalized(String.format(Locale.US,
+                        "SELECT mid FROM messages_topics WHERE uid = %d AND topic_id IN (%s)",
+                        dialogId, topics));
+                while (archiveCursor.next()) {
+                    archiveMids.add(archiveCursor.intValue(0));
+                }
+                archiveCursor.dispose();
+                archiveCursor = null;
                 database.executeFast(String.format(Locale.US, "DELETE FROM topics WHERE did = %d AND topic_id IN (%s)", dialogId, topics)).stepThis().dispose();
-                try {
-                    database.executeFast(String.format(Locale.US,
+                database.executeFast(String.format(Locale.US,
                         "DELETE FROM messages_v2 WHERE uid = %d AND mid IN (" +
                                 "SELECT mid FROM messages_topics WHERE uid = %d AND topic_id IN (%s)" +
                                 ")",
                         dialogId, dialogId, topics)).stepThis().dispose();
-                } catch (SQLiteException e) {
-                    e.printStackTrace();
-                }
                 database.executeFast(String.format(Locale.US, "DELETE FROM messages_topics WHERE uid = %d AND topic_id IN (%s)", dialogId, topics)).stepThis().dispose();
+                for (int i = 0; i < archiveMids.size(); i++) {
+                    AgramDeletedMediaStore.purgeMessage(currentAccount, dialogId, archiveMids.get(i));
+                }
             } catch (SQLiteException e) {
                 e.printStackTrace();
+            } finally {
+                if (archiveCursor != null) {
+                    archiveCursor.dispose();
+                }
             }
         });
     }
@@ -4462,6 +4520,8 @@ public class MessagesStorage extends BaseController {
                     if (cursor.next()) {
                         long last_mid_i = cursor.longValue(0);
                         long last_mid = cursor.longValue(1);
+                        ArrayList<Integer> archivedMessageIdsToPurge = getArchivePurgeMessageIds(
+                                did, true, last_mid_i, last_mid);
                         cursor2 = database.queryFinalized("SELECT data FROM messages_v2 WHERE uid = " + did + " AND mid IN (" + last_mid_i + "," + last_mid + ")");
                         try {
                             while (cursor2.next()) {
@@ -4485,6 +4545,8 @@ public class MessagesStorage extends BaseController {
 
                         database.executeFast("DELETE FROM messages_v2 WHERE uid = " + did + " AND mid != " + last_mid_i + " AND mid != " + last_mid).stepThis().dispose();
                         database.executeFast("DELETE FROM messages_topics WHERE uid = " + did + " AND mid != " + last_mid_i + " AND mid != " + last_mid).stepThis().dispose();
+                        AgramDeletedMediaStore.purgeDialogExcept(currentAccount, did,
+                                archivedMessageIdsToPurge, last_mid_i, last_mid);
                         database.executeFast("DELETE FROM messages_holes WHERE uid = " + did).stepThis().dispose();
                         database.executeFast("DELETE FROM bot_keyboard WHERE uid = " + did).stepThis().dispose();
                         database.executeFast("DELETE FROM bot_keyboard_topics WHERE uid = " + did).stepThis().dispose();
@@ -4509,9 +4571,12 @@ public class MessagesStorage extends BaseController {
                     return;
                 }
 
+                ArrayList<Integer> archivedMessageIdsToPurge = getArchivePurgeMessageIds(
+                        did, false, 0, 0);
                 database.executeFast("UPDATE dialogs SET unread_count = 0, unread_count_i = 0 WHERE did = " + did).stepThis().dispose();
                 database.executeFast("DELETE FROM messages_v2 WHERE uid = " + did).stepThis().dispose();
                 database.executeFast("DELETE FROM messages_topics WHERE uid = " + did).stepThis().dispose();
+                AgramDeletedMediaStore.purgeDialog(currentAccount, did, archivedMessageIdsToPurge);
                 database.executeFast("DELETE FROM bot_keyboard WHERE uid = " + did).stepThis().dispose();
                 database.executeFast("DELETE FROM bot_keyboard_topics WHERE uid = " + did).stepThis().dispose();
                 database.executeFast("DELETE FROM media_counts_v2 WHERE uid = " + did).stepThis().dispose();
@@ -4539,6 +4604,101 @@ public class MessagesStorage extends BaseController {
                 }
             }
         });
+    }
+
+    /**
+     * Captures exact retained-deletion marker IDs before their rows are removed. A broad
+     * mid cutoff is unsafe because older history can be inserted again in the same process;
+     * exact IDs only suppress stale MessageObjects for rows this deletion actually removed.
+     */
+    private ArrayList<Integer> getArchivePurgeMessageIds(long dialogId, boolean excludeRetained,
+                                                          long retainedMessageId1,
+                                                          long retainedMessageId2) throws SQLiteException {
+        final int maximumIds = 16384;
+        ArrayList<Integer> result = new ArrayList<>();
+        HashSet<Integer> seen = new HashSet<>();
+        String exclusions = excludeRetained
+                ? " AND mid != " + retainedMessageId1 + " AND mid != " + retainedMessageId2
+                : "";
+        collectArchivePurgeMessageIds("messages_v2", dialogId, exclusions,
+                maximumIds, result, seen);
+        if (result.size() < maximumIds) {
+            collectArchivePurgeMessageIds("messages_topics", dialogId, exclusions,
+                    maximumIds, result, seen);
+        }
+        return result;
+    }
+
+    private void collectArchivePurgeMessageIds(String table, long dialogId, String exclusions,
+                                                int maximumIds, ArrayList<Integer> result,
+                                                HashSet<Integer> seen) throws SQLiteException {
+        SQLiteCursor cursor = null;
+        try {
+            int remaining = maximumIds - result.size();
+            if (remaining <= 0) {
+                return;
+            }
+            cursor = database.queryFinalized("SELECT mid, custom_params FROM " + table
+                    + " WHERE uid = " + dialogId + " AND custom_params IS NOT NULL"
+                    + exclusions + " ORDER BY date DESC LIMIT " + remaining);
+            while (result.size() < maximumIds && cursor.next()) {
+                int messageId = cursor.intValue(0);
+                if (seen.contains(messageId)) {
+                    continue;
+                }
+                NativeByteBuffer customParams = cursor.byteBufferValue(1);
+                if (hasAgramDeletedMarker(customParams)) {
+                    seen.add(messageId);
+                    result.add(messageId);
+                }
+            }
+        } finally {
+            if (cursor != null) {
+                cursor.dispose();
+            }
+        }
+    }
+
+    private ArrayList<Integer> getArchivePurgeTopicOnlyMessageIds(long dialogId)
+            throws SQLiteException {
+        return getArchivePurgeExclusiveMessageIds(
+                "messages_topics", "messages_v2", dialogId);
+    }
+
+    private ArrayList<Integer> getArchivePurgeMainOnlyMessageIds(long dialogId)
+            throws SQLiteException {
+        return getArchivePurgeExclusiveMessageIds(
+                "messages_v2", "messages_topics", dialogId);
+    }
+
+    private ArrayList<Integer> getArchivePurgeExclusiveMessageIds(String sourceTable,
+                                                                   String survivingTable,
+                                                                   long dialogId)
+            throws SQLiteException {
+        final int maximumIds = 16384;
+        ArrayList<Integer> result = new ArrayList<>();
+        HashSet<Integer> seen = new HashSet<>();
+        SQLiteCursor cursor = null;
+        try {
+            cursor = database.queryFinalized("SELECT t.mid, t.custom_params FROM " + sourceTable + " t"
+                    + " WHERE t.uid = " + dialogId + " AND t.custom_params IS NOT NULL"
+                    + " AND NOT EXISTS (SELECT 1 FROM " + survivingTable + " m"
+                    + " WHERE m.uid = t.uid AND m.mid = t.mid)"
+                    + " ORDER BY t.date DESC LIMIT " + maximumIds);
+            while (result.size() < maximumIds && cursor.next()) {
+                int messageId = cursor.intValue(0);
+                if (!seen.contains(messageId)
+                        && hasAgramDeletedMarker(cursor.byteBufferValue(1))) {
+                    seen.add(messageId);
+                    result.add(messageId);
+                }
+            }
+        } finally {
+            if (cursor != null) {
+                cursor.dispose();
+            }
+        }
+        return result;
     }
 
     public void onDeleteQueryComplete(long did) {
@@ -4620,6 +4780,12 @@ public class MessagesStorage extends BaseController {
                 cursor.dispose();
                 cursor = null;
                 String ids = "(" + TextUtils.join(",", dids) + ")";
+                LongSparseArray<ArrayList<Integer>> archivedMessagesToPurge = new LongSparseArray<>();
+                for (int i = 0; i < dids.size(); i++) {
+                    long did = dids.get(i);
+                    archivedMessagesToPurge.put(did,
+                            getArchivePurgeMainOnlyMessageIds(did));
+                }
 
                 database.beginTransaction();
                 database.executeFast("DELETE FROM chat_pinned_count WHERE uid IN " + ids).stepThis().dispose();
@@ -4633,6 +4799,14 @@ public class MessagesStorage extends BaseController {
                 database.executeFast("DELETE FROM messages_holes WHERE uid IN " + ids).stepThis().dispose();
                 database.executeFast("DELETE FROM media_holes_v2 WHERE uid IN " + ids).stepThis().dispose();
                 database.commitTransaction();
+                for (int i = 0; i < archivedMessagesToPurge.size(); i++) {
+                    long did = archivedMessagesToPurge.keyAt(i);
+                    ArrayList<Integer> messageIds = archivedMessagesToPurge.valueAt(i);
+                    for (int j = 0; j < messageIds.size(); j++) {
+                        AgramDeletedMediaStore.purgeMessage(
+                                currentAccount, did, messageIds.get(j));
+                    }
+                }
 
                 for (int a = 0; a < totalPinnedCount; a++) {
                     TLRPC.Dialog dialog = dialogsRes.dialogs.get(dialogsCount + a);
@@ -5682,6 +5856,185 @@ public class MessagesStorage extends BaseController {
             }
         }
         return message;
+    }
+
+    /**
+     * Resolves the filesystem-journal/SQLite crash window for deleted-media archiving.
+     * Result: 1 = the exact row has the local deleted marker, 0 = absent/not marked,
+     * -1 = transient database/read failure (the journal must be retained and retried).
+     */
+    public void reconcileAgramDeletedMediaMarker(long dialogId, int messageId,
+                                                  Utilities.Callback<Integer> callback) {
+        executeInStorageQueue(() -> {
+            int result = -1;
+            SQLiteCursor cursor = null;
+            try {
+                boolean rowFound = false;
+                boolean marked = false;
+                cursor = database.queryFinalized(
+                        "SELECT custom_params FROM messages_v2 WHERE mid = ? AND uid = ?",
+                        messageId, dialogId);
+                if (cursor.next()) {
+                    rowFound = true;
+                    marked = hasAgramDeletedMarker(cursor.byteBufferValue(0));
+                }
+                cursor.dispose();
+                cursor = null;
+                if (!marked) {
+                    cursor = database.queryFinalized(
+                            "SELECT custom_params FROM messages_topics WHERE mid = ? AND uid = ?",
+                            messageId, dialogId);
+                    if (cursor.next()) {
+                        rowFound = true;
+                        marked = hasAgramDeletedMarker(cursor.byteBufferValue(0));
+                    }
+                }
+                result = rowFound && marked ? 1 : 0;
+            } catch (Throwable e) {
+                FileLog.e("Unable to reconcile deleted-media journal marker", e);
+            } finally {
+                if (cursor != null) {
+                    cursor.dispose();
+                }
+                callback.run(result);
+            }
+        });
+    }
+
+    /** Batched variant used to remove archive directories whose backing rows no longer exist. */
+    public void reconcileAgramDeletedMediaMarkers(long[] dialogIds, int[] messageIds,
+                                                   Utilities.Callback<int[]> callback) {
+        executeInStorageQueue(() -> {
+            int count = dialogIds == null || messageIds == null
+                    ? 0 : Math.min(dialogIds.length, messageIds.length);
+            int[] results = new int[count];
+            if (count == 0) {
+                callback.run(results);
+                return;
+            }
+            HashMap<String, Integer> indexes = new HashMap<>();
+            StringBuilder where = new StringBuilder();
+            for (int i = 0; i < count; i++) {
+                if (i != 0) {
+                    where.append(" OR ");
+                }
+                where.append("(uid = ").append(dialogIds[i])
+                        .append(" AND mid = ").append(messageIds[i]).append(')');
+                indexes.put(dialogIds[i] + ":" + messageIds[i], i);
+            }
+            try {
+                reconcileAgramDeletedMediaMarkersInTable(
+                        "messages_v2", where.toString(), indexes, results);
+                reconcileAgramDeletedMediaMarkersInTable(
+                        "messages_topics", where.toString(), indexes, results);
+            } catch (Throwable e) {
+                FileLog.e("Unable to batch-reconcile deleted-media archive markers", e);
+                for (int i = 0; i < results.length; i++) {
+                    results[i] = -1;
+                }
+            }
+            callback.run(results);
+        });
+    }
+
+    private void reconcileAgramDeletedMediaMarkersInTable(String table, String where,
+                                                            HashMap<String, Integer> indexes,
+                                                            int[] results) throws SQLiteException {
+        SQLiteCursor cursor = null;
+        try {
+            cursor = database.queryFinalized("SELECT uid, mid, custom_params FROM " + table
+                    + " WHERE " + where);
+            while (cursor.next()) {
+                Integer index = indexes.get(cursor.longValue(0) + ":" + cursor.intValue(1));
+                NativeByteBuffer customParams = cursor.byteBufferValue(2);
+                boolean marked = hasAgramDeletedMarker(customParams);
+                if (index != null && marked) {
+                    results[index] = 1;
+                }
+            }
+        } finally {
+            if (cursor != null) {
+                cursor.dispose();
+            }
+        }
+    }
+
+    private static boolean hasAgramDeletedMarker(NativeByteBuffer customParams) {
+        if (customParams == null) {
+            return false;
+        }
+        try {
+            int version = customParams.readInt32(false);
+            int flags = customParams.readInt32(false);
+            return version == 1 && (flags & TLObject.FLAG_14) != 0;
+        } finally {
+            customParams.reuse();
+        }
+    }
+
+    /** DB-backed supplement to the per-message noforwards flag; called on storageQueue. */
+    private boolean isPeerNoForwardsForDeletedMedia(long dialogId) {
+        if (dialogId == 0 || DialogObject.isEncryptedDialog(dialogId)) {
+            return true;
+        }
+        try {
+            MessagesController controller = getMessagesController();
+            if (dialogId > 0) {
+                TLRPC.UserFull userFull = controller.getUserFull(dialogId);
+                if (userFull == null) {
+                    SQLiteCursor cursor = null;
+                    try {
+                        cursor = database.queryFinalized(
+                                "SELECT info FROM user_settings WHERE uid = " + dialogId);
+                        if (!cursor.next()) {
+                            // No persisted UserFull means there is no known peer-level override;
+                            // the caller still enforces the canonical message.noforwards flag.
+                            return false;
+                        }
+                        NativeByteBuffer data = cursor.byteBufferValue(0);
+                        if (data == null) {
+                            return true;
+                        }
+                        try {
+                            userFull = TLRPC.UserFull.TLdeserialize(
+                                    data, data.readInt32(false), false);
+                        } finally {
+                            data.reuse();
+                        }
+                    } finally {
+                        if (cursor != null) {
+                            cursor.dispose();
+                        }
+                    }
+                }
+                return userFull == null
+                        || userFull.noforwards_peer_enabled
+                        || userFull.noforwards_my_enabled;
+            }
+
+            long chatId = -dialogId;
+            TLRPC.Chat chat = controller.getChat(chatId);
+            if (chat == null) {
+                chat = getChat(chatId);
+            }
+            if (chat == null) {
+                return false;
+            }
+            if (chat.noforwards) {
+                return true;
+            }
+            if (chat.migrated_to != null) {
+                TLRPC.Chat migrated = controller.getChat(chat.migrated_to.channel_id);
+                if (migrated == null) {
+                    migrated = getChat(chat.migrated_to.channel_id);
+                }
+                return migrated != null && migrated.noforwards;
+            }
+            return false;
+        } catch (Throwable e) {
+            FileLog.e("Unable to validate protected peer for deleted-media retention", e);
+            return true;
+        }
     }
 
     public void getNewTask(LongSparseArray<ArrayList<Integer>> oldTask, LongSparseArray<ArrayList<Integer>> oldTaskMedia) {
@@ -11419,6 +11772,9 @@ public class MessagesStorage extends BaseController {
                 cursor.dispose();
                 cursor = null;
 
+                ArrayList<Integer> archivedMessagesToPurge = getArchivePurgeMessageIds(
+                        did, false, 0, 0);
+
                 database.executeFast("DELETE FROM chat_pinned_count WHERE uid = " + did).stepThis().dispose();
                 database.executeFast("DELETE FROM chat_pinned_v2 WHERE uid = " + did).stepThis().dispose();
                 database.executeFast("DELETE FROM messages_v2 WHERE uid = " + did).stepThis().dispose();
@@ -11435,6 +11791,8 @@ public class MessagesStorage extends BaseController {
                 database.executeFast("UPDATE media_counts_topics SET old = 1 WHERE uid = " + did).stepThis().dispose();
                 database.executeFast("DELETE FROM messages_topics WHERE uid = " + did).stepThis().dispose();
                 database.executeFast("DELETE FROM messages_holes_topics WHERE uid = " + did).stepThis().dispose();
+
+                AgramDeletedMediaStore.purgeDialog(currentAccount, did, archivedMessagesToPurge);
 
                 getMediaDataController().clearBotKeyboard(did);
 
@@ -14675,6 +15033,14 @@ public class MessagesStorage extends BaseController {
                     while (cursor.next()) {
                         long did = cursor.longValue(0);
                         int mid = cursor.intValue(5);
+                        ArrayList<Integer> archiveMids = messagesByDialogs.get(did);
+                        if (archiveMids == null) {
+                            archiveMids = new ArrayList<>();
+                            messagesByDialogs.put(did, archiveMids);
+                        }
+                        if (!archiveMids.contains(mid)) {
+                            archiveMids.add(mid);
+                        }
                         long topicId = 0;
                         unknownMessagesInTopics.remove((Integer) mid);
 
@@ -14887,6 +15253,9 @@ public class MessagesStorage extends BaseController {
                     }
                     database.executeFast(String.format(Locale.US, "DELETE FROM messages_v2 WHERE mid IN(%s) AND uid = %d", ids, did)).stepThis().dispose();
                     database.executeFast(String.format(Locale.US, "DELETE FROM messages_topics WHERE mid IN(%s) AND uid = %d", ids, did)).stepThis().dispose();
+                    for (int archiveIndex = 0; archiveIndex < mids.size(); archiveIndex++) {
+                        AgramDeletedMediaStore.purgeMessage(currentAccount, did, mids.get(archiveIndex));
+                    }
                     database.executeFast(String.format(Locale.US, "DELETE FROM polls_v2 WHERE mid IN(%s) AND uid = %d", ids, did)).stepThis().dispose();
                     database.executeFast(String.format(Locale.US, "DELETE FROM bot_keyboard WHERE mid IN(%s) AND uid = %d", ids, did)).stepThis().dispose();
                     database.executeFast(String.format(Locale.US, "DELETE FROM bot_keyboard_topics WHERE mid IN(%s) AND uid = %d", ids, did)).stepThis().dispose();
@@ -15313,6 +15682,8 @@ public class MessagesStorage extends BaseController {
 
     public ArrayList<Integer> markMessagesDeletedOnServer(long dialogId, ArrayList<Integer> messages) {
         ArrayList<Integer> keptMessages = new ArrayList<>();
+        ArrayList<AgramDeletedMediaStore.PreparedArchive> preparedArchives = new ArrayList<>();
+        boolean transactionCommitted = false;
         if (messages == null || messages.isEmpty()) {
             return keptMessages;
         }
@@ -15354,7 +15725,8 @@ public class MessagesStorage extends BaseController {
                     MessageCustomParamsHelper.readLocalParams(message, oldCustomParams);
                     oldCustomParams.reuse();
                 }
-                if (!MessageObject.canKeepDeletedOnServer(message, messageDialogId)) {
+                if (!MessageObject.canKeepDeletedOnServer(message, messageDialogId)
+                        || isPeerNoForwardsForDeletedMedia(messageDialogId)) {
                     continue;
                 }
                 message.agramDeletedOnServer = true;
@@ -15362,29 +15734,58 @@ public class MessagesStorage extends BaseController {
                 if (customParams == null) {
                     continue;
                 }
-                messagesState.requery();
-                messagesState.bindByteBuffer(1, customParams);
-                messagesState.bindInteger(2, messageId);
-                messagesState.bindLong(3, messageDialogId);
-                messagesState.step();
+                AgramDeletedMediaStore.PreparedArchive preparedArchive = null;
+                try {
+                    // Persist the source pin before the DB commit. Actual media I/O is started
+                    // only after commit below.
+                    preparedArchive = AgramDeletedMediaStore.prepareArchive(currentAccount, message);
+                } catch (Throwable e) {
+                    FileLog.e("Unable to prepare deleted-message media archive", e);
+                }
+                boolean rowUpdated = false;
+                try {
+                    messagesState.requery();
+                    messagesState.bindByteBuffer(1, customParams);
+                    messagesState.bindInteger(2, messageId);
+                    messagesState.bindLong(3, messageDialogId);
+                    messagesState.step();
 
-                topicsState.requery();
-                topicsState.bindByteBuffer(1, customParams);
-                topicsState.bindInteger(2, messageId);
-                topicsState.bindLong(3, messageDialogId);
-                topicsState.step();
-                customParams.reuse();
+                    topicsState.requery();
+                    topicsState.bindByteBuffer(1, customParams);
+                    topicsState.bindInteger(2, messageId);
+                    topicsState.bindLong(3, messageDialogId);
+                    topicsState.step();
+                    rowUpdated = true;
+                } finally {
+                    if (preparedArchive != null) {
+                        if (rowUpdated) {
+                            preparedArchives.add(preparedArchive);
+                        } else {
+                            AgramDeletedMediaStore.cancelPreparedArchive(preparedArchive);
+                        }
+                    }
+                    customParams.reuse();
+                }
                 if (!keptMessages.contains(messageId)) {
                     keptMessages.add(messageId);
                 }
             }
             database.commitTransaction();
+            transactionCommitted = true;
         } catch (Exception e) {
             keptMessages.clear();
             checkSQLException(e);
         } finally {
-            if (database != null) {
-                database.commitTransaction();
+            if (database != null && !transactionCommitted) {
+                try {
+                    // This storage method historically finalizes partial work in finally. If an
+                    // earlier statement threw but this commit succeeds, its archive promises must
+                    // be activated as well or the persisted deletion marker can lose its media.
+                    database.commitTransaction();
+                    transactionCommitted = true;
+                } catch (Exception e) {
+                    checkSQLException(e);
+                }
             }
             if (cursor != null) {
                 cursor.dispose();
@@ -15394,6 +15795,18 @@ public class MessagesStorage extends BaseController {
             }
             if (topicsState != null) {
                 topicsState.dispose();
+            }
+        }
+        for (int i = 0; i < preparedArchives.size(); i++) {
+            AgramDeletedMediaStore.PreparedArchive preparedArchive = preparedArchives.get(i);
+            if (transactionCommitted) {
+                try {
+                    AgramDeletedMediaStore.commitPreparedArchive(preparedArchive);
+                } catch (Throwable e) {
+                    FileLog.e("Unable to commit deleted-message media archive", e);
+                }
+            } else {
+                AgramDeletedMediaStore.cancelPreparedArchive(preparedArchive);
             }
         }
         return keptMessages;
@@ -15421,13 +15834,15 @@ public class MessagesStorage extends BaseController {
             ArrayList<File> filesToDelete = new ArrayList<>();
             ArrayList<String> namesToDelete = new ArrayList<>();
             ArrayList<Pair<Long, Integer>> idsToDelete = new ArrayList<>();
+            ArrayList<Integer> archiveMessagesToPurge = new ArrayList<>();
             long currentUser = getUserConfig().getClientUserId();
 
-            cursor = database.queryFinalized(String.format(Locale.US, "SELECT uid, data, read_state, out, mention FROM messages_v2 WHERE uid = %d AND mid <= %d", -channelId, mid));
+            cursor = database.queryFinalized(String.format(Locale.US, "SELECT uid, data, read_state, out, mention, mid FROM messages_v2 WHERE uid = %d AND mid <= %d", -channelId, mid));
 
             try {
                 while (cursor.next()) {
                     long did = cursor.longValue(0);
+                    archiveMessagesToPurge.add(cursor.intValue(5));
                     if (did != currentUser) {
                         int read_state = cursor.intValue(2);
                         if (cursor.intValue(3) == 0) {
@@ -15518,6 +15933,10 @@ public class MessagesStorage extends BaseController {
 
             database.executeFast(String.format(Locale.US, "DELETE FROM messages_v2 WHERE uid = %d AND mid <= %d", -channelId, mid)).stepThis().dispose();
             database.executeFast(String.format(Locale.US, "DELETE FROM messages_topics WHERE uid = %d AND mid <= %d", -channelId, mid)).stepThis().dispose();
+            for (int archiveIndex = 0; archiveIndex < archiveMessagesToPurge.size(); archiveIndex++) {
+                AgramDeletedMediaStore.purgeMessage(currentAccount, -channelId,
+                        archiveMessagesToPurge.get(archiveIndex));
+            }
             database.executeFast(String.format(Locale.US, "DELETE FROM media_v4 WHERE uid = %d AND mid <= %d", -channelId, mid)).stepThis().dispose();
             database.executeFast(String.format(Locale.US, "UPDATE media_counts_v2 SET old = 1 WHERE uid = %d", -channelId)).stepThis().dispose();
             database.executeFast(String.format(Locale.US, "UPDATE media_counts_topics SET old = 1 WHERE uid = %d", -channelId)).stepThis().dispose();

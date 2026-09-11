@@ -22,6 +22,10 @@ public final class AgramNetworkController {
 
     public void apply(int account) {
         apply(account, true);
+        // The push stream is a separate HTTPS connection. Recreate it after
+        // every user-visible route change so it cannot keep using the previous
+        // direct/SOCKS path while MTProto has already switched routes.
+        AgramPushController.getInstance().onNetworkRouteChanged(account);
     }
 
     public void prepare(int account) {
@@ -32,21 +36,7 @@ public final class AgramNetworkController {
         synchronized (stateLock) {
             managedAccounts[account] = true;
         }
-        AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().ensureContainer(account);
         AgramContainerManager.ProxyProfile proxy = AgramContainerManager.getInstance().getProxyProfile(account);
-        if (AgramContainerManager.NETWORK_TOR.equals(proxy.mode)) {
-            int port = AgramTorManager.getInstance().getSocksPort();
-            if (port > 0) {
-                applyTor(account, record, port, resume);
-            } else {
-                // Tor can take time to bootstrap. Pause first so neither MTProto
-                // nor push can escape over the direct connection in that window.
-                pause(account, "tor_starting");
-                ConnectionsManager.native_setProxySettings(account, "", 1080, "", "", "");
-                AgramTorManager.getInstance().ensureStarted();
-            }
-            return;
-        }
         if (AgramContainerManager.NETWORK_PROXY.equals(proxy.mode)) {
             if (TextUtils.isEmpty(proxy.address)) {
                 ConnectionsManager.native_setProxySettings(account, "", 1080, "", "", "");
@@ -61,7 +51,6 @@ public final class AgramNetworkController {
             if (resume) {
                 ConnectionsManager.native_resumeNetwork(account, false);
             }
-            AgramTorManager.getInstance().stopIfUnused();
             return;
         }
         ConnectionsManager.native_setProxySettings(account, "", 1080, "", "", "");
@@ -69,44 +58,6 @@ public final class AgramNetworkController {
         if (resume) {
             ConnectionsManager.native_resumeNetwork(account, false);
         }
-        AgramTorManager.getInstance().stopIfUnused();
-    }
-
-    public void onTorStateChanged(String torState, int port) {
-        for (int account = 0; account < UserConfig.MAX_ACCOUNT_COUNT; account++) {
-            if (!isManaged(account)) {
-                continue;
-            }
-            AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(account);
-            if (record == null || !AgramContainerManager.NETWORK_TOR.equals(record.proxyMode)) {
-                continue;
-            }
-            if (AgramTorManager.STATE_READY.equals(torState) && port > 0) {
-                applyTor(account, record, port, true);
-                final int routeAccount = account;
-                AndroidUtilities.runOnUIThread(() ->
-                        AgramSessionRouteController.getInstance().refresh(routeAccount, true), 3_000);
-            } else {
-                pause(account, AgramTorManager.STATE_ERROR.equals(torState) ? "tor_error" : "tor_unavailable");
-                ConnectionsManager.native_setProxySettings(account, "", 1080, "", "", "");
-            }
-            AgramPushController.getInstance().onNetworkRouteChanged(account);
-        }
-    }
-
-    /** Assigns a fresh Tor circuit group to this container only. */
-    public void rotateTorCircuit(int account) {
-        AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(account);
-        if (record == null || !AgramContainerManager.NETWORK_TOR.equals(record.proxyMode)) {
-            return;
-        }
-        pause(account, "tor_rotating");
-        AgramContainerManager.getInstance().rotateTorIsolation(account);
-        AgramSessionRouteController.getInstance().clear(account);
-        AgramPushController.getInstance().onNetworkRouteChanged(account);
-        apply(account, true);
-        AndroidUtilities.runOnUIThread(() ->
-                AgramSessionRouteController.getInstance().refresh(account, true), 4_000);
     }
 
     public void onProxyError() {
@@ -117,8 +68,7 @@ public final class AgramNetworkController {
             AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(account);
             if (record != null && record.killSwitch
                     && !AgramContainerManager.NETWORK_DIRECT.equals(record.proxyMode)) {
-                pause(account, AgramContainerManager.NETWORK_TOR.equals(record.proxyMode)
-                        ? "tor_error" : "proxy_error");
+                pause(account, "proxy_error");
             }
         }
     }
@@ -127,17 +77,6 @@ public final class AgramNetworkController {
         synchronized (stateLock) {
             String value = state[account];
             return value == null ? "not_applied" : value;
-        }
-    }
-
-    private void applyTor(int account, AgramContainerManager.ContainerRecord record, int port, boolean resume) {
-        String isolationId = TextUtils.isEmpty(record.torIsolationId)
-                ? "agram-account-" + account : record.torIsolationId;
-        ConnectionsManager.native_setProxySettings(
-                account, "127.0.0.1", port, "<torS0X>0", isolationId, "");
-        setState(account, "tor_active");
-        if (resume) {
-            ConnectionsManager.native_resumeNetwork(account, false);
         }
     }
 

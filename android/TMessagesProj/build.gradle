@@ -19,7 +19,6 @@ idea {
 repositories {
     mavenCentral()
     google()
-    maven { url 'https://raw.githubusercontent.com/guardianproject/gpmaven/master' }
 }
 
 configurations {
@@ -39,13 +38,6 @@ dependencies {
     implementation "androidx.sharetarget:sharetarget:1.2.0"
     implementation 'androidx.interpolator:interpolator:1.0.0'
     implementation 'androidx.biometric:biometric:1.1.0'
-    // 0.4.8.17.2 is the current Tor 0.4.8 LTS artifact compatible with this
-    // project's Android 36 / Java 17 toolchain. 0.4.9.11 requires API 37.
-    implementation 'info.guardianproject:tor-android:0.4.8.17.2'
-    implementation 'info.guardianproject:jtorctl:0.4.5.7'
-    // Pluggable transports run in-process; no Orbot installation is required.
-    implementation 'com.netzarchitekten:IPtProxy:5.5.1'
-
     implementation 'com.google.android.gms:play-services-cast-framework:21.4.0'
     implementation "androidx.mediarouter:mediarouter:1.7.0"
     implementation 'com.google.zxing:core:3.5.4'

@@ -3878,18 +3878,41 @@ void ConnectionsManager::setNetworkAvailable(bool value, int32_t type, bool slow
             }
             return;
         }
+        const bool restorePendingNetworkState = value
+                && (!networkAvailable || connectionState == ConnectionStateWaitingForNetwork);
         networkAvailable = value;
         currentNetworkType = type;
         networkSlow = slow;
         if (!networkAvailable) {
             connectionState = ConnectionStateWaitingForNetwork;
         } else {
+            if (connectionState == ConnectionStateWaitingForNetwork) {
+                Datacenter *datacenter = getDatacenterWithId(DEFAULT_DATACENTER_ID);
+                Connection *genericConnection = datacenter != nullptr
+                        ? datacenter->getGenericConnection(false, 0)
+                        : nullptr;
+                const bool liveGenericConnection = genericConnection != nullptr
+                        && genericConnection->getConnectionToken() != 0
+                        && !genericConnection->isSuspended();
+                connectionState = liveGenericConnection
+                        ? ConnectionStateConnected
+                        : (proxyAddress.empty()
+                                ? ConnectionStateConnecting
+                                : ConnectionStateConnectingViaProxy);
+            }
             for (auto & datacenter : datacenters) {
                 if (datacenter.second->isHandshaking(false)) {
                     datacenter.second->createGenericConnection()->connect();
                 } else if (datacenter.second->isHandshaking(true)) {
                     datacenter.second->createGenericMediaConnection()->connect();
                 }
+            }
+            if (restorePendingNetworkState) {
+                // A live generic socket can survive a short Android network
+                // transition. In that case no new onConnected/onData callback
+                // arrives to clear WaitingForNetwork, and queued requests stay
+                // dormant until another unrelated event processes them.
+                processRequestQueue(0, 0);
             }
         }
         if (delegate != nullptr) {

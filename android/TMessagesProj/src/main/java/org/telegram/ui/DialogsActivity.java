@@ -102,7 +102,6 @@ import androidx.viewpager.widget.ViewPager;
 import org.telegram.messenger.AccountInstance;
 import org.telegram.messenger.AgramContainerManager;
 import org.telegram.messenger.AgramNetworkController;
-import org.telegram.messenger.AgramTorManager;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.AnimationNotificationsLocker;
 import org.telegram.messenger.ApplicationLoader;
@@ -2839,13 +2838,10 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
 
     private NotificationCenter.ObserversGroup observersGroup;
     private NotificationCenter.ObserversGroup globalObserversGroup;
-    private final AgramTorManager.Listener agramTorListener = state -> updateAgramRouteHeader();
 
     @Override
     public boolean onFragmentCreate() {
         super.onFragmentCreate();
-
-        AgramTorManager.getInstance().addListener(agramTorListener);
 
         if (arguments != null) {
             onlySelect = arguments.getBoolean("onlySelect", false);
@@ -3084,7 +3080,6 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
 
     @Override
     public void onFragmentDestroy() {
-        AgramTorManager.getInstance().removeListener(agramTorListener);
         super.onFragmentDestroy();
         if (observersGroup != null) {
             observersGroup.removeAllObservers();
@@ -3462,8 +3457,8 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             agramNetworkDrawable.setColorFilter(new PorterDuffColorFilter(
                     getThemedColor(Theme.key_actionBarDefaultIcon), PorterDuff.Mode.MULTIPLY));
             agramNetworkItem = menu.addItemWithWidth(AGRAM_NETWORK_ITEM_ID,
-                    agramNetworkDrawable, dp(40), "Tor / proxy текущего контейнера");
-            agramNetworkItem.setOnClickListener(v -> presentFragment(new AgramTorSettingsActivity(currentAccount)));
+                    agramNetworkDrawable, dp(40), "Сеть и proxy текущего контейнера");
+            agramNetworkItem.setOnClickListener(v -> presentFragment(new AgramContainerSetupActivity(currentAccount)));
             updateAgramRouteHeader();
 
             ghostModeItem = menu.addItem(GHOST_MODE_ITEM_ID, R.drawable.msg_stories_stealth2);
@@ -7089,21 +7084,7 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
         String mode = record == null ? AgramContainerManager.NETWORK_DIRECT : record.proxyMode;
         String modeLabel;
         String secondLine;
-        if (AgramContainerManager.NETWORK_TOR.equals(mode)) {
-            AgramTorManager tor = AgramTorManager.getInstance();
-            String torState = tor.getState();
-            modeLabel = AgramTorManager.STATE_READY.equals(torState) ? "◉ TOR" :
-                    (AgramTorManager.STATE_ERROR.equals(torState) ? "! TOR" : "… TOR");
-            if (AgramTorManager.STATE_READY.equals(torState)) {
-                secondLine = "соединение установлено";
-            } else if (AgramTorManager.STATE_STARTING.equals(torState)) {
-                secondLine = tor.getBootstrapProgress() + "% · подключение";
-            } else if (AgramTorManager.STATE_ERROR.equals(torState)) {
-                secondLine = "ошибка запуска";
-            } else {
-                secondLine = "не запущен";
-            }
-        } else if (AgramContainerManager.NETWORK_PROXY.equals(mode)) {
+        if (AgramContainerManager.NETWORK_PROXY.equals(mode)) {
             modeLabel = "◆ PROXY";
             secondLine = "маршрут аккаунта";
         } else {
@@ -7111,13 +7092,13 @@ public class DialogsActivity extends BaseFragment implements NotificationCenter.
             secondLine = "прямое соединение";
         }
         if (agramNetworkDrawable != null) {
-            boolean routed = !AgramContainerManager.NETWORK_DIRECT.equals(mode);
+            boolean routed = AgramContainerManager.NETWORK_PROXY.equals(mode);
             String networkState = AgramNetworkController.getInstance().getState(currentAccount);
-            boolean connected = routed && ("tor_active".equals(networkState) || "proxy_active".equals(networkState));
+            boolean connected = routed && "proxy_active".equals(networkState);
             agramNetworkDrawable.setConnected(routed, connected, true);
         }
         if (agramNetworkItem != null) {
-            agramNetworkItem.setContentDescription(modeLabel + ". " + secondLine + ". Открыть управление Tor и proxy");
+            agramNetworkItem.setContentDescription(modeLabel + ". " + secondLine + ". Открыть настройки сети и proxy");
         }
     }
 

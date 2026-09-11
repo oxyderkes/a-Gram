@@ -13084,7 +13084,8 @@ public class MessageObject {
                 if (messageOwner == null || messageOwner.media == null || messageOwner.media.document == null || messageOwner.media.alt_documents.isEmpty()) {
                     return videoQualitiesCached = false;
                 }
-                videoQualities = VideoPlayer.getQualities(currentAccount, messageOwner != null ? messageOwner.media : null, useFileDatabaseQueue);
+                videoQualities = VideoPlayer.getQualities(currentAccount,
+                        messageOwner != null ? messageOwner.media : null, useFileDatabaseQueue, this);
                 videoQualitiesCached = videoQualities != null && videoQualities.size() > 1;
                 highestQuality = VideoPlayer.getQualityForPlayer(videoQualities);
                 thumbQuality = VideoPlayer.getQualityForThumb(videoQualities);
@@ -13565,6 +13566,7 @@ public class MessageObject {
     public static boolean canKeepDeletedOnServer(TLRPC.Message message, long dialogId) {
         return message != null
                 && !DialogObject.isEncryptedDialog(dialogId)
+                && !message.noforwards
                 && message.ttl == 0
                 && message.ttl_period == 0
                 && !isSecretMedia(message)

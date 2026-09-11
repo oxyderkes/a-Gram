@@ -27,7 +27,6 @@ import android.widget.Toast;
 import org.telegram.messenger.AgramContainerManager;
 import org.telegram.messenger.AgramNetworkController;
 import org.telegram.messenger.AgramPushController;
-import org.telegram.messenger.AgramTorManager;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.BuildVars;
 import org.telegram.messenger.LocaleController;
@@ -63,7 +62,6 @@ public class AgramContainerSetupActivity extends BaseFragment {
 
     private RadioButton directNetwork;
     private RadioButton proxyNetwork;
-    private RadioButton torNetwork;
     private LinearLayout proxyFields;
     private EditText proxyAddressField;
     private EditText proxyPortField;
@@ -71,7 +69,6 @@ public class AgramContainerSetupActivity extends BaseFragment {
     private EditText proxyPasswordField;
     private EditText proxySecretField;
     private Switch killSwitch;
-    private TextView torStatusAction;
 
     private RadioButton agramPush;
     private RadioButton directPush;
@@ -87,8 +84,6 @@ public class AgramContainerSetupActivity extends BaseFragment {
     private RadioButton hiddenNotifications;
     private RadioButton authorNotifications;
     private RadioButton fullNotifications;
-    private final AgramTorManager.Listener torStateListener = state -> updateTorStatusAction();
-
     public AgramContainerSetupActivity() {
         this(UserConfig.getLoginTargetAccount());
     }
@@ -107,14 +102,7 @@ public class AgramContainerSetupActivity extends BaseFragment {
         }
         pendingPresetIndex = record.presetIndex;
         pendingProfileId = TextUtils.isEmpty(record.profileId) ? UUID.randomUUID().toString() : record.profileId;
-        AgramTorManager.getInstance().addListener(torStateListener);
         return super.onFragmentCreate();
-    }
-
-    @Override
-    public void onFragmentDestroy() {
-        AgramTorManager.getInstance().removeListener(torStateListener);
-        super.onFragmentDestroy();
     }
 
     @Override
@@ -237,15 +225,12 @@ public class AgramContainerSetupActivity extends BaseFragment {
         LinearLayout card = card(context);
         content.addView(card, LayoutHelper.createLinear(-1, -2, 0, 0, 0, 12));
         card.addView(sectionLabel(context, "СЕТЬ ЭТОГО КОНТЕЙНЕРА"));
-        directNetwork = radio(context, "Прямое соединение", "Без локального proxy/Tor.");
+        directNetwork = radio(context, "Прямое соединение", "Без локального прокси.");
         proxyNetwork = radio(context, "Свой прокси", "SOCKS5 или MTProto, только для этого аккаунта.");
-        torNetwork = radio(context, "Встроенный Tor", "Работает внутри Agram; Orbot и внешний distributor не нужны.");
         card.addView(directNetwork);
         card.addView(proxyNetwork);
-        card.addView(torNetwork);
         directNetwork.setOnClickListener(v -> selectNetworkMode(AgramContainerManager.NETWORK_DIRECT));
         proxyNetwork.setOnClickListener(v -> selectNetworkMode(AgramContainerManager.NETWORK_PROXY));
-        torNetwork.setOnClickListener(v -> selectNetworkMode(AgramContainerManager.NETWORK_TOR));
 
         proxyFields = new LinearLayout(context);
         proxyFields.setOrientation(LinearLayout.VERTICAL);
@@ -265,20 +250,8 @@ public class AgramContainerSetupActivity extends BaseFragment {
 
         killSwitch = settingSwitch(context, "Kill switch: не выходить в сеть без выбранного маршрута", record.killSwitch);
         card.addView(killSwitch);
-        torStatusAction = action(context, "ОТКРЫТЬ НАСТРОЙКИ TOR");
-        torStatusAction.setOnClickListener(v -> {
-            selectNetworkMode(AgramContainerManager.NETWORK_TOR);
-            if (AgramTorManager.STATE_ERROR.equals(AgramTorManager.getInstance().getState())) {
-                AgramTorManager.getInstance().restart();
-            } else {
-                AgramTorManager.getInstance().ensureStarted();
-            }
-            updateTorStatusAction();
-            presentFragment(new AgramTorSettingsActivity(account));
-        });
-        card.addView(torStatusAction, LayoutHelper.createLinear(-1, 44, 0, 8, 0, 0));
         TextView note = text(context,
-                "Один встроенный Tor-процесс экономит память, а отдельный SOCKS-auth token из зашифрованной карточки контейнера разделяет его circuit-группу. Tor всегда fail-closed: до готовности маршрута MTProto этого контейнера стоит на паузе, локальная история остаётся доступной.",
+                "При ошибке пользовательского прокси kill switch ставит MTProto-сеть только этого контейнера на паузу. Локальная история остаётся доступной.",
                 12, Theme.key_windowBackgroundWhiteGrayText, false);
         note.setLineSpacing(AndroidUtilities.dp(2), 1f);
         card.addView(note, LayoutHelper.createLinear(-1, -2, 0, 8, 0, 0));
@@ -295,7 +268,7 @@ public class AgramContainerSetupActivity extends BaseFragment {
         agramPush.setOnClickListener(v -> selectPushMode(AgramContainerManager.PUSH_AGRAM));
         directPush.setOnClickListener(v -> selectPushMode(AgramContainerManager.PUSH_DIRECT));
         TextView note = text(context,
-                "Внешнее приложение не требуется. Endpoint хранится в зашифрованной записи контейнера и регистрируется в Telegram как Simple Push type 4 без объединения other_uids. Через SOCKS5/Tor push следует маршруту контейнера и никогда не обходит его напрямую.",
+                "Внешнее приложение не требуется. Endpoint хранится в зашифрованной записи контейнера и регистрируется в Telegram как Simple Push type 4 без объединения other_uids. Через SOCKS5 push следует маршруту контейнера. MTProto-прокси не переносит HTTPS push, поэтому Agram Push остаётся недоступен, а не обходит его напрямую.",
                 12, Theme.key_windowBackgroundWhiteGrayText, false);
         note.setLineSpacing(AndroidUtilities.dp(2), 1f);
         card.addView(note, LayoutHelper.createLinear(-1, -2, 0, 8, 0, 0));
@@ -523,44 +496,13 @@ public class AgramContainerSetupActivity extends BaseFragment {
 
     private void selectNetworkMode(String mode) {
         boolean proxy = AgramContainerManager.NETWORK_PROXY.equals(mode);
-        boolean tor = AgramContainerManager.NETWORK_TOR.equals(mode);
-        directNetwork.setChecked(!proxy && !tor);
+        directNetwork.setChecked(!proxy);
         proxyNetwork.setChecked(proxy);
-        torNetwork.setChecked(tor);
         proxyFields.setVisibility(proxy ? View.VISIBLE : View.GONE);
-        killSwitch.setEnabled(proxy || tor);
+        killSwitch.setEnabled(proxy);
         killSwitch.setAlpha(killSwitch.isEnabled() ? 1f : .5f);
-        if (!proxy && !tor) killSwitch.setChecked(false);
-        else if (tor) killSwitch.setChecked(true);
-        if (tor) {
-            // Selecting the built-in route starts bootstrap immediately. The
-            // network controller still remains fail-closed until it is ready.
-            killSwitch.setEnabled(false);
-            killSwitch.setAlpha(.65f);
-            AgramTorManager.getInstance().ensureStarted();
-        }
-        if (torStatusAction != null) {
-            torStatusAction.setVisibility(tor ? View.VISIBLE : View.GONE);
-            updateTorStatusAction();
-        }
+        if (!proxy) killSwitch.setChecked(false);
         updatePreview();
-    }
-
-    private void updateTorStatusAction() {
-        if (torStatusAction == null) {
-            return;
-        }
-        String torState = AgramTorManager.getInstance().getState();
-        if (AgramTorManager.STATE_READY.equals(torState)) {
-            torStatusAction.setText("TOR ПОДКЛЮЧЁН · ОТКРЫТЬ УПРАВЛЕНИЕ");
-        } else if (AgramTorManager.STATE_STARTING.equals(torState)) {
-            torStatusAction.setText("TOR " + AgramTorManager.getInstance().getBootstrapProgress()
-                    + "% · СЕТЬ ЗАБЛОКИРОВАНА");
-        } else if (AgramTorManager.STATE_ERROR.equals(torState)) {
-            torStatusAction.setText("ОШИБКА TOR · ОТКРЫТЬ УПРАВЛЕНИЕ");
-        } else {
-            torStatusAction.setText("ОТКРЫТЬ НАСТРОЙКИ TOR");
-        }
     }
 
     private void selectPushMode(String mode) {
@@ -576,7 +518,6 @@ public class AgramContainerSetupActivity extends BaseFragment {
     }
 
     private String selectedNetworkMode() {
-        if (torNetwork != null && torNetwork.isChecked()) return AgramContainerManager.NETWORK_TOR;
         if (proxyNetwork != null && proxyNetwork.isChecked()) return AgramContainerManager.NETWORK_PROXY;
         return AgramContainerManager.NETWORK_DIRECT;
     }
