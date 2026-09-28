@@ -39,6 +39,7 @@ jmethodID jclass_ConnectionsManager_getInitFlags;
 jmethodID jclass_ConnectionsManager_onPremiumFloodWait;
 jmethodID jclass_ConnectionsManager_onIntegrityCheckClassic;
 jmethodID jclass_ConnectionsManager_onCaptchaCheck;
+jmethodID jclass_ConnectionsManager_onNativeOwnerTransition;
 
 bool check_utf8(const char *data, size_t len);
 
@@ -384,12 +385,13 @@ class Delegate : public ConnectiosManagerDelegate {
     }
 
     void onProxyError(int32_t instanceNum) {
-        jniEnv[instanceNum]->CallStaticVoidMethod(jclass_ConnectionsManager, jclass_ConnectionsManager_onProxyError);
+        jniEnv[instanceNum]->CallStaticVoidMethod(jclass_ConnectionsManager, jclass_ConnectionsManager_onProxyError, instanceNum);
     }
 
     void getHostByName(std::string domain, int32_t instanceNum, ConnectionSocket *socket) {
         jstring domainName = jniEnv[instanceNum]->NewStringUTF(domain.c_str());
-        jniEnv[instanceNum]->CallStaticVoidMethod(jclass_ConnectionsManager, jclass_ConnectionsManager_getHostByName, domainName, (jlong) (intptr_t) socket);
+        jniEnv[instanceNum]->CallStaticVoidMethod(jclass_ConnectionsManager, jclass_ConnectionsManager_getHostByName,
+                instanceNum, domainName, (jlong) (intptr_t) socket, (jlong) socket->getHostResolveToken());
         jniEnv[instanceNum]->DeleteLocalRef(domainName);
     }
 
@@ -419,7 +421,8 @@ class Delegate : public ConnectiosManagerDelegate {
 
 };
 
-void onHostNameResolved(JNIEnv *env, jclass c, jstring host, jlong address, jstring ip) {
+void onHostNameResolved(JNIEnv *env, jclass c, jint instanceNum, jstring host, jlong address, jlong token, jstring ip) {
+    if (instanceNum < 0 || instanceNum >= MAX_ACCOUNT_COUNT || address == 0 || token == 0) return;
     const char *ipStr = env->GetStringUTFChars(ip, 0);
     const char *hostStr = env->GetStringUTFChars(host, 0);
     std::string i = std::string(ipStr);
@@ -431,7 +434,7 @@ void onHostNameResolved(JNIEnv *env, jclass c, jstring host, jlong address, jstr
         env->ReleaseStringUTFChars(host, hostStr);
     }
     ConnectionSocket *socket = (ConnectionSocket *) (intptr_t) address;
-    socket->onHostNameResolved(h, i, false);
+    ConnectionSocket::completeHostResolve(instanceNum, socket, (uint64_t) token, h, i);
 }
 
 void discardConnection(JNIEnv *env, jclass c,  jint instanceNum, jint datacenerId, jint connectionType) {
@@ -490,7 +493,34 @@ void setSessionProfile(JNIEnv *env, jclass c, jint instanceNum, jstring deviceMo
     env->ReleaseStringUTFChars(systemLangCode, systemLangCodeStr);
 }
 
-void init(JNIEnv *env, jclass c, jint instanceNum, jint version, jint layer, jint apiId, jstring deviceModel, jstring systemVersion, jstring appVersion, jstring langCode, jstring systemLangCode, jstring configPath, jstring logPath, jstring regId, jstring cFingerprint, jstring installerId, jstring packageId, jint timezoneOffset, jlong userId, jboolean userPremium, jboolean enablePushConnection, jboolean hasNetwork, jint networkType, jint performanceClass) {
+std::string ownerString(JNIEnv *env, jstring owner) {
+    if (owner == nullptr) return "";
+    const char *value = env->GetStringUTFChars(owner, nullptr);
+    if (value == nullptr) return "";
+    const std::string result(value);
+    env->ReleaseStringUTFChars(owner, value);
+    return result;
+}
+
+jboolean isContainerOwnerReady(JNIEnv *env, jclass c, jint instanceNum, jstring expectedOwner) {
+    return ConnectionsManager::getInstance(instanceNum).isContainerOwnerReady(ownerString(env, expectedOwner));
+}
+
+jstring getContainerOwner(JNIEnv *env, jclass c, jint instanceNum) {
+    const std::string owner = ConnectionsManager::getInstance(instanceNum).getContainerOwner();
+    return env->NewStringUTF(owner.c_str());
+}
+
+void transitionContainerOwner(JNIEnv *env, jclass c, jint instanceNum, jstring expectedOwner, jstring newOwner, jlong transitionId) {
+    ConnectionsManager::getInstance(instanceNum).transitionContainerOwner(ownerString(env, expectedOwner), ownerString(env, newOwner),
+            [instanceNum, transitionId](bool success) {
+                jniEnv[instanceNum]->CallStaticVoidMethod(jclass_ConnectionsManager,
+                        jclass_ConnectionsManager_onNativeOwnerTransition, instanceNum, transitionId,
+                        static_cast<jboolean>(success));
+            });
+}
+
+void init(JNIEnv *env, jclass c, jint instanceNum, jint version, jint layer, jint apiId, jstring deviceModel, jstring systemVersion, jstring appVersion, jstring langCode, jstring systemLangCode, jstring configPath, jstring logPath, jstring regId, jstring cFingerprint, jstring installerId, jstring packageId, jint timezoneOffset, jlong userId, jboolean userPremium, jboolean enablePushConnection, jboolean hasNetwork, jint networkType, jint performanceClass, jstring containerOwnerId, jboolean retirementPending) {
     const char *deviceModelStr = env->GetStringUTFChars(deviceModel, 0);
     const char *systemVersionStr = env->GetStringUTFChars(systemVersion, 0);
     const char *appVersionStr = env->GetStringUTFChars(appVersion, 0);
@@ -505,7 +535,7 @@ void init(JNIEnv *env, jclass c, jint instanceNum, jint version, jint layer, jin
 
     ConnectionsManager &manager = ConnectionsManager::getInstance(instanceNum);
     manager.setDelegate(new Delegate());
-    manager.init((uint32_t) version, layer, apiId, std::string(deviceModelStr), std::string(systemVersionStr), std::string(appVersionStr), std::string(langCodeStr), std::string(systemLangCodeStr), std::string(configPathStr), std::string(logPathStr), std::string(regIdStr), std::string(cFingerprintStr), std::string(installerIdStr), std::string(packageIdStr), timezoneOffset, userId, userPremium, true, enablePushConnection, hasNetwork, networkType, performanceClass);
+    manager.init((uint32_t) version, layer, apiId, std::string(deviceModelStr), std::string(systemVersionStr), std::string(appVersionStr), std::string(langCodeStr), std::string(systemLangCodeStr), std::string(configPathStr), std::string(logPathStr), std::string(regIdStr), std::string(cFingerprintStr), std::string(installerIdStr), std::string(packageIdStr), timezoneOffset, userId, userPremium, true, enablePushConnection, hasNetwork, networkType, performanceClass, ownerString(env, containerOwnerId), retirementPending);
 
     if (deviceModelStr != 0) {
         env->ReleaseStringUTFChars(deviceModel, deviceModelStr);
@@ -564,14 +594,17 @@ static JNINativeMethod ConnectionsManagerMethods[] = {
         {"native_setProxySettings", "(ILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", (void *) setProxySettings},
         {"native_getConnectionState", "(I)I", (void *) getConnectionState},
         {"native_setUserId", "(IJ)V", (void *) setUserId},
-        {"native_init", "(IIIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;IJZZZII)V", (void *) init},
+        {"native_init", "(IIIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;IJZZZIILjava/lang/String;Z)V", (void *) init},
+        {"native_isContainerOwnerReady", "(ILjava/lang/String;)Z", (void *) isContainerOwnerReady},
+        {"native_getContainerOwner", "(I)Ljava/lang/String;", (void *) getContainerOwner},
+        {"native_transitionContainerOwner", "(ILjava/lang/String;Ljava/lang/String;J)V", (void *) transitionContainerOwner},
         {"native_setLangCode", "(ILjava/lang/String;)V", (void *) setLangCode},
         {"native_setRegId", "(ILjava/lang/String;)V", (void *) setRegId},
         {"native_setSystemLangCode", "(ILjava/lang/String;)V", (void *) setSystemLangCode},
         {"native_setSessionProfile", "(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)V", (void *) setSessionProfile},
         {"native_switchBackend", "(IZ)V", (void *) switchBackend},
         {"native_pauseNetwork", "(I)V", (void *) pauseNetwork},
-        {"native_resumeNetwork", "(IZ)V", (void *) resumeNetwork},
+        {"native_resumeNetworkOwned", "(IZ)V", (void *) resumeNetwork},
         {"native_updateDcSettings", "(I)V", (void *) updateDcSettings},
         {"native_moveDatacenter", "(II)V", (void *) moveDatacenter},
         {"native_setIpStrategy", "(IB)V", (void *) setIpStrategy},
@@ -580,7 +613,7 @@ static JNINativeMethod ConnectionsManagerMethods[] = {
         {"native_setJava", "(Z)V", (void *) setJava},
         {"native_applyDnsConfig", "(IJLjava/lang/String;I)V", (void *) applyDnsConfig},
         {"native_checkProxy", "(ILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Lorg/telegram/tgnet/RequestTimeDelegate;)J", (void *) checkProxy},
-        {"native_onHostNameResolved", "(Ljava/lang/String;JLjava/lang/String;)V", (void *) onHostNameResolved},
+        {"native_onHostNameResolved", "(ILjava/lang/String;JJLjava/lang/String;)V", (void *) onHostNameResolved},
         {"native_discardConnection", "(III)V", (void *) discardConnection},
         {"native_failNotRunningRequest", "(II)V", (void *) failNotRunningRequest},
         {"native_receivedIntegrityCheckClassic", "(IILjava/lang/String;Ljava/lang/String;)V", (void *) receivedIntegrityCheckClassic},
@@ -636,6 +669,10 @@ extern "C" int registerNativeTgNetFunctions(JavaVM *vm, JNIEnv *env) {
     DEBUG_REF("ConnectionsManager class");
     jclass_ConnectionsManager = (jclass) env->NewGlobalRef(env->FindClass("org/telegram/tgnet/ConnectionsManager"));
     if (jclass_ConnectionsManager == 0) {
+        return JNI_FALSE;
+    }
+    jclass_ConnectionsManager_onNativeOwnerTransition = env->GetStaticMethodID(jclass_ConnectionsManager, "onNativeOwnerTransition", "(IJZ)V");
+    if (jclass_ConnectionsManager_onNativeOwnerTransition == 0) {
         return JNI_FALSE;
     }
     jclass_ConnectionsManager_onRequestClear = env->GetStaticMethodID(jclass_ConnectionsManager, "onRequestClear", "(IIZ)V");
@@ -694,11 +731,11 @@ extern "C" int registerNativeTgNetFunctions(JavaVM *vm, JNIEnv *env) {
     if (jclass_ConnectionsManager_onRequestNewServerIpAndPort == 0) {
         return JNI_FALSE;
     }
-    jclass_ConnectionsManager_onProxyError = env->GetStaticMethodID(jclass_ConnectionsManager, "onProxyError", "()V");
+    jclass_ConnectionsManager_onProxyError = env->GetStaticMethodID(jclass_ConnectionsManager, "onProxyError", "(I)V");
     if (jclass_ConnectionsManager_onProxyError == 0) {
         return JNI_FALSE;
     }
-    jclass_ConnectionsManager_getHostByName = env->GetStaticMethodID(jclass_ConnectionsManager, "getHostByName", "(Ljava/lang/String;J)V");
+    jclass_ConnectionsManager_getHostByName = env->GetStaticMethodID(jclass_ConnectionsManager, "getHostByName", "(ILjava/lang/String;JJ)V");
     if (jclass_ConnectionsManager_getHostByName == 0) {
         return JNI_FALSE;
     }

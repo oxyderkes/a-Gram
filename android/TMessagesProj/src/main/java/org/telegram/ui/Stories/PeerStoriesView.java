@@ -392,6 +392,7 @@ public class PeerStoriesView extends SizeNotifierFrameLayout implements Notifica
     boolean inBlackoutMode;
     boolean checkBlackoutMode;
     private boolean messageSent;
+    private boolean ghostStoryReplyWarningAccepted;
     private boolean isCaptionPartVisible;
     private boolean stealthModeIsActive;
     private ImageReceiver reactionEffectImageReceiver;
@@ -2604,8 +2605,25 @@ public class PeerStoriesView extends SizeNotifierFrameLayout implements Notifica
         runWithGhostReactionWarning(() -> likeStoryConfirmed(visibleReaction));
     }
 
+    private boolean shouldWarnBeforeGhostInteraction() {
+        return AgramContainerManager.getInstance().shouldWarnBeforeInteraction(currentAccount);
+    }
+
+    private void runWithGhostReplyWarning(Runnable action) {
+        if (!shouldWarnBeforeGhostInteraction()) {
+            action.run();
+            return;
+        }
+        new AlertDialog.Builder(getContext(), resourcesProvider)
+                .setTitle("Ghost Mode")
+                .setMessage("Ответ на историю будет отправлен собеседнику и раскроет вашу активность.")
+                .setNegativeButton("Отмена", null)
+                .setPositiveButton("Отправить", (dialog, which) -> action.run())
+                .show();
+    }
+
     private void runWithGhostReactionWarning(Runnable action) {
-        if (!AgramContainerManager.getInstance().shouldWarnBeforeInteraction(currentAccount)) {
+        if (!shouldWarnBeforeGhostInteraction()) {
             action.run();
             return;
         }
@@ -3172,6 +3190,17 @@ public class PeerStoriesView extends SizeNotifierFrameLayout implements Notifica
                     openKeyboard();
                     return false;
                 }
+                if (shouldWarnBeforeGhostInteraction() && !ghostStoryReplyWarningAccepted) {
+                    runWithGhostReplyWarning(() -> {
+                        ghostStoryReplyWarningAccepted = true;
+                        try {
+                            sendMessage();
+                        } finally {
+                            ghostStoryReplyWarningAccepted = false;
+                        }
+                    });
+                    return false;
+                }
                 if (currentStory.isLive) {
                     final long stars = Math.max(messageStars, getMessageMinPrice());
 
@@ -3688,12 +3717,13 @@ public class PeerStoriesView extends SizeNotifierFrameLayout implements Notifica
         mentionContainer.withDelegate(new MentionsContainerView.Delegate() {
             @Override
             public void onStickerSelected(TLRPC.TL_document document, String query, Object parent) {
-                AlertsCreator.ensurePaidMessageConfirmation(currentAccount, dialogId, 1, payStars -> {
-                    SendMessagesHelper.getInstance(currentAccount).sendSticker(document, query, dialogId, null, null, currentStory.storyItem, null, null, true, 0, 0, false, parent, null, payStars, chatActivityEnterView.getSendMonoForumPeerId(), chatActivityEnterView.getSendMessageSuggestionParams());
-                    chatActivityEnterView.addStickerToRecent(document);
-                    chatActivityEnterView.setFieldText("");
-                    afterMessageSend(payStars <= 0);
-                });
+                runWithGhostReplyWarning(() ->
+                        AlertsCreator.ensurePaidMessageConfirmation(currentAccount, dialogId, 1, payStars -> {
+                            SendMessagesHelper.getInstance(currentAccount).sendSticker(document, query, dialogId, null, null, currentStory.storyItem, null, null, true, 0, 0, false, parent, null, payStars, chatActivityEnterView.getSendMonoForumPeerId(), chatActivityEnterView.getSendMessageSuggestionParams());
+                            chatActivityEnterView.addStickerToRecent(document);
+                            chatActivityEnterView.setFieldText("");
+                            afterMessageSend(payStars <= 0);
+                        }));
             }
 
             @Override
@@ -5063,7 +5093,7 @@ public class PeerStoriesView extends SizeNotifierFrameLayout implements Notifica
                         if (storyItem.media != null) {
                             thumbDrawable = ImageLoader.createStripedBitmap(storyItem.media.getDocument().thumbs);
                         }
-                        if (storyItem.firstFramePath != null && ImageLoader.getInstance().isInMemCache(ImageLocation.getForPath(storyItem.firstFramePath).getKey(null, null, false) + "@" + filter, false)) {
+                        if (storyItem.firstFramePath != null && ImageLoader.getInstance().isInMemCache(currentAccount, ImageLocation.getForPath(storyItem.firstFramePath).getKey(null, null, false) + "@" + filter, false)) {
                             imageReceiver.setImage(null, null, ImageLocation.getForPath(storyItem.firstFramePath), filter, null, null, thumbDrawable, 0, null, null, 0);
                         } else {
                             imageReceiver.setImage(null, null, ImageLocation.getForPath(storyItem.attachPath), filter + "_pframe", null, null, thumbDrawable, 0, null, null, 0);
@@ -6439,7 +6469,7 @@ public class PeerStoriesView extends SizeNotifierFrameLayout implements Notifica
             sendAsUri = true;
         } else if (tempPath == null) {
             originalPath = uri.toString();
-            tempPath = MediaController.copyFileToCache(uri, "file");
+            tempPath = MediaController.copyFileToCache(currentAccount, uri, "file");
 
             if (tempPath == null) {
                 showAttachmentError();
@@ -7917,12 +7947,17 @@ public class PeerStoriesView extends SizeNotifierFrameLayout implements Notifica
             reactionsContainerLayout.setDelegate(new ReactionsContainerLayout.ReactionsContainerDelegate() {
                 @Override
                 public void onReactionClicked(View view, ReactionsLayoutInBubble.VisibleReaction visibleReaction, boolean longpress, boolean addToRecent) {
-                    onReactionClickedInternal(view, visibleReaction, longpress, addToRecent, !longpress);
+                    onReactionClickedInternal(view, visibleReaction, longpress, addToRecent, !longpress, false);
                 }
 
-                void onReactionClickedInternal(View view, ReactionsLayoutInBubble.VisibleReaction visibleReaction, boolean longpress, boolean addToRecent, boolean allowConfirm) {
+                void onReactionClickedInternal(View view, ReactionsLayoutInBubble.VisibleReaction visibleReaction, boolean longpress, boolean addToRecent, boolean allowConfirm, boolean ghostConfirmed) {
+                    if (shouldWarnBeforeGhostInteraction() && !ghostConfirmed) {
+                        runWithGhostReactionWarning(() ->
+                                onReactionClickedInternal(view, visibleReaction, longpress, addToRecent, allowConfirm, true));
+                        return;
+                    }
                     if (allowConfirm && applyMessageToChat(() -> {
-                            onReactionClickedInternal(view, visibleReaction, longpress, addToRecent, false);
+                            onReactionClickedInternal(view, visibleReaction, longpress, addToRecent, false, ghostConfirmed);
                         })) {
                         return;
                     }
@@ -8236,9 +8271,9 @@ public class PeerStoriesView extends SizeNotifierFrameLayout implements Notifica
             optionsDrawable = ContextCompat.getDrawable(context, R.drawable.media_more);
             pipDrawable = ContextCompat.getDrawable(context, R.drawable.menu_stream_pip);
             deleteDrawable = ContextCompat.getDrawable(context, R.drawable.msg_delete);
-            muteDrawable = new RLottieDrawable(R.raw.media_mute_unmute, "media_mute_unmute", AndroidUtilities.dp(28), AndroidUtilities.dp(28), true, null);
+            muteDrawable = new RLottieDrawable(R.raw.media_mute_unmute, AndroidUtilities.dp(28), AndroidUtilities.dp(28), true, null);
            // muteDrawable = new ReplaceableIconDrawable(context);
-            noSoundDrawable = new RLottieDrawable(R.raw.media_mute_unmute, "media_mute_unmute", AndroidUtilities.dp(28), AndroidUtilities.dp(28), true, null);
+            noSoundDrawable = new RLottieDrawable(R.raw.media_mute_unmute, AndroidUtilities.dp(28), AndroidUtilities.dp(28), true, null);
             noSoundDrawable.setCurrentFrame(20, false, true);
             noSoundDrawable.stop();
           //  muteDrawable = new CrossOutDrawable(context, R.drawable.msg_unmute, -1);

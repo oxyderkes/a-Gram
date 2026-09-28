@@ -1,0 +1,322 @@
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <cerrno>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <map>
+#include <stdexcept>
+#include <filesystem>
+#include <sys/stat.h>
+#include <fcntl.h>
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#define O_DIRECTORY 0
+#define O_CLOEXEC 0
+#define S_ISREG(mode) (((mode) & _S_IFMT) == _S_IFREG)
+#else
+#include <unistd.h>
+#endif
+
+// No transport or account data: production Config operates only under argv[1].
+static unsigned assertions;
+static std::string fault;
+static unsigned faultAt = 1;
+static unsigned faultSeen;
+static const int DirectoryDescriptor = 0x3fffffff;
+
+static void require(bool condition, const std::string &description) {
+    ++assertions;
+    if (!condition) throw std::runtime_error(description);
+}
+static bool fail(const char *operation) {
+    if (fault == operation && ++faultSeen == faultAt) {
+        errno = EIO;
+        return true;
+    }
+    return false;
+}
+static void inject(const std::string &operation = "", unsigned occurrence = 1) {
+    fault = operation;
+    faultAt = occurrence;
+    faultSeen = 0;
+}
+static int test_stat(const char *path, struct stat *metadata) {
+    if (fail("stat")) return -1;
+    return stat(path, metadata);
+}
+static FILE *test_fopen(const char *path, const char *mode) {
+    if (std::strchr(mode, 'w') && fail("open_write")) return nullptr;
+    if (!std::strchr(mode, 'w') && fail("open_read")) return nullptr;
+    return std::fopen(path, mode);
+}
+static size_t test_fwrite(const void *data, size_t size, size_t count, FILE *stream) {
+    if (fail("write")) return 0;
+    return std::fwrite(data, size, count, stream);
+}
+static int test_fflush(FILE *stream) {
+    if (fail("flush")) return EOF;
+    return std::fflush(stream);
+}
+static int test_fclose(FILE *stream) {
+    bool failed = fail("file_close");
+    int result = std::fclose(stream);
+    return failed ? EOF : result;
+}
+static int test_fileno(FILE *stream) {
+#ifdef _WIN32
+    return _fileno(stream);
+#else
+    return fileno(stream);
+#endif
+}
+static int test_fchmod(int descriptor, int mode) {
+    if (fail("permissions")) return -1;
+#ifdef _WIN32
+    return 0; // Windows has no POSIX descriptor permissions; failure branch is still exercised.
+#else
+    return fchmod(descriptor, mode);
+#endif
+}
+static int test_open(const char *path, int flags) {
+    if (fail("directory_open")) return -1;
+#ifdef _WIN32
+    return std::filesystem::is_directory(path) ? DirectoryDescriptor : -1;
+#else
+    return open(path, flags);
+#endif
+}
+static int test_fsync(int descriptor) {
+#ifdef _WIN32
+    const bool directory = descriptor == DirectoryDescriptor;
+#else
+    struct stat value;
+    const bool directory = fstat(descriptor, &value) == 0 && S_ISDIR(value.st_mode);
+#endif
+    if (fail(directory ? "directory_sync" : "file_sync")) return -1;
+#ifdef _WIN32
+    return directory ? 0 : _commit(descriptor);
+#else
+    return fsync(descriptor);
+#endif
+}
+static int test_close(int descriptor) {
+    bool failed = fail("directory_close");
+#ifdef _WIN32
+    int result = descriptor == DirectoryDescriptor ? 0 : _close(descriptor);
+#else
+    int result = close(descriptor);
+#endif
+    return failed ? -1 : result;
+}
+static int test_remove(const char *path) {
+    if (fail("remove")) return -1;
+    return std::remove(path);
+}
+static int test_rename(const char *from, const char *to) {
+    if (fail("rename")) return -1;
+#ifdef _WIN32
+    // Match POSIX atomic replacement semantics; all paths are disposable test files.
+    if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING)) return 0;
+    errno = EIO;
+    return -1;
+#else
+    return std::rename(from, to);
+#endif
+}
+
+class NativeByteBuffer {
+    std::vector<uint8_t> data;
+public:
+    explicit NativeByteBuffer(uint32_t size) : data(size) { }
+    uint8_t *bytes() { return data.data(); }
+    uint32_t position() const { return static_cast<uint32_t>(data.size()); }
+    void reuse() { delete this; }
+};
+class BuffersStorage {
+public:
+    static BuffersStorage &getInstance() { static BuffersStorage storage; return storage; }
+    NativeByteBuffer *getFreeBuffer(uint32_t size) {
+        if (size > 1024 * 1024) throw std::runtime_error("corrupt config requested oversized allocation");
+        return new NativeByteBuffer(size);
+    }
+};
+class ConnectionsManager {
+public:
+    std::string currentConfigPath;
+    static ConnectionsManager &getInstance(int32_t instance) { static ConnectionsManager manager; return manager; }
+};
+
+#define LOGS_ENABLED false
+#define DEBUG_D(...) ((void) 0)
+#define DEBUG_E(...) ((void) 0)
+#define fopen test_fopen
+#define fwrite test_fwrite
+#define fflush test_fflush
+#define fclose test_fclose
+#define fileno test_fileno
+#define fchmod test_fchmod
+#define open test_open
+#define fsync test_fsync
+#define close test_close
+#define remove test_remove
+#define rename test_rename
+#define stat(path, metadata) test_stat(path, metadata)
+/* CONFIG_HEADER */
+/* CONFIG_SOURCE */
+#undef stat
+#undef fopen
+#undef fwrite
+#undef fflush
+#undef fclose
+#undef fileno
+#undef fchmod
+#undef open
+#undef fsync
+#undef close
+#undef remove
+#undef rename
+/* OWNER_POLICY */
+
+static NativeByteBuffer *payload(const std::string &value) {
+    auto buffer = new NativeByteBuffer(static_cast<uint32_t>(value.size()));
+    std::memcpy(buffer->bytes(), value.data(), value.size());
+    return buffer;
+}
+static bool write(Config &config, const std::string &value) {
+    auto buffer = payload(value);
+    bool result = config.writeConfig(buffer);
+    buffer->reuse();
+    return result;
+}
+static std::string read(Config &config) {
+    auto buffer = config.readConfig();
+    if (buffer == nullptr) return "";
+    std::string result(reinterpret_cast<char *>(buffer->bytes()), buffer->position());
+    buffer->reuse();
+    return result;
+}
+static void rawFile(const std::filesystem::path &path, const std::string &value) {
+    FILE *file = std::fopen(path.string().c_str(), "wb");
+    require(file != nullptr, "create fixture file");
+    require(std::fwrite(value.data(), 1, value.size(), file) == value.size(), "write fixture file");
+    require(std::fclose(file) == 0, "close fixture file");
+}
+static void testPolicy() {
+    using namespace AgramNativeOwnerPolicy;
+    const std::string a = "01234567-89ab-cdef-0123-456789abcdef";
+    const std::string b = "fedcba98-7654-3210-fedc-ba9876543210";
+    require(validOwner(a) && validOwner(b), "valid lowercase owner UUIDs");
+    require(!validOwner("") && !validOwner("../tgnet.dat") && !validOwner("01234567-89AB-cdef-0123-456789abcdef"), "reject unknown/path/noncanonical owners");
+    require(startup(a, a, true, true, true) == StartupAction::Keep, "preserve bound active session");
+    require(startup(a, a, true, false, true) == StartupAction::Keep, "preserve same owner login session");
+    require(startup(a, "", false, true, true) == StartupAction::BindLegacyActive, "legacy active adoption requires durable bind");
+    require(startup(a, b, true, true, true) == StartupAction::Quarantine, "never reassign active foreign owner");
+    require(startup(a, b, true, false, true) == StartupAction::RetireAndBind, "inactive foreign owner must retire keys");
+    require(startup(a, "", false, false, true) == StartupAction::RetireAndBind, "inactive legacy leftovers must retire keys");
+    require(startup("", a, true, true, true) == StartupAction::Quarantine, "unavailable Java owner cannot adopt");
+    require(startup(a, a, true, true, false) == StartupAction::Quarantine, "corrupt config cannot be trusted even with matching owner");
+}
+static void testIO(const std::filesystem::path &root) {
+    unsigned sequence = 0;
+    auto location = [&]() {
+        inject();
+        auto directory = root / std::to_string(++sequence);
+        std::filesystem::create_directories(directory);
+        ConnectionsManager::getInstance(0).currentConfigPath = directory.generic_string() + "/";
+        return directory;
+    };
+    auto directory = location();
+    Config initial(0, "tgnet.dat");
+    require(write(initial, "old-owner-and-auth"), "initial durable write");
+    require(write(initial, "new-owner-and-auth"), "replacement durable write");
+    Config reopened(0, "tgnet.dat");
+    require(read(reopened) == "new-owner-and-auth", "read exact replacement payload");
+    require(!std::filesystem::exists(directory / "tgnet.dat.bak"), "successful write removes stale backup");
+
+    const std::vector<std::pair<std::string, unsigned>> failures = {
+        {"open_write", 1}, {"permissions", 1}, {"write", 1}, {"write", 2}, {"flush", 1},
+        {"file_sync", 1}, {"file_close", 1}, {"remove", 1}, {"rename", 1}, {"rename", 2},
+        {"directory_open", 1}, {"directory_close", 1}, {"directory_sync", 1},
+        {"directory_sync", 2}, {"remove", 2}, {"directory_sync", 3}, {"stat", 1}, {"stat", 2}
+    };
+    for (const auto &failure : failures) {
+        directory = location();
+        Config config(0, "tgnet.dat");
+        require(write(config, "old-owner-and-auth"), "seed fault scenario");
+        inject(failure.first, failure.second);
+        require(!write(config, "replacement-owner-and-auth"), "must reject failed durability: " + failure.first + std::to_string(failure.second));
+        require(faultSeen >= failure.second, "fault was exercised");
+        inject();
+        Config restart(0, "tgnet.dat");
+        const std::string recovered = read(restart);
+        require(recovered == "old-owner-and-auth" || recovered == "replacement-owner-and-auth", "failed transition keeps a complete recoverable payload");
+        // A failed acknowledgement remains blocked in Java even if the new complete file survived.
+    }
+    directory = location();
+    Config backupSeed(0, "tgnet.dat");
+    require(write(backupSeed, "backup-owner-and-auth"), "seed backup recovery");
+    std::filesystem::rename(directory / "tgnet.dat", directory / "tgnet.dat.bak");
+    rawFile(directory / "tgnet.dat", "broken");
+    Config recoverBackup(0, "tgnet.dat");
+    require(!recoverBackup.hasReadFailure() && read(recoverBackup) == "backup-owner-and-auth", "process-death invalid main restores complete backup");
+    directory = location();
+    Config mainSeed(0, "tgnet.dat");
+    Config oldBackup(0, "older.dat");
+    require(write(mainSeed, "current-owner-and-auth") && write(oldBackup, "older-owner-and-auth"), "seed main plus older backup");
+    std::filesystem::rename(directory / "older.dat", directory / "tgnet.dat.bak");
+    Config keepMain(0, "tgnet.dat");
+    require(read(keepMain) == "current-owner-and-auth", "complete main wins over older valid backup");
+    require(!std::filesystem::exists(directory / "tgnet.dat.bak"), "older backup cannot resurrect on next startup");
+    for (unsigned occurrence : {1u, 2u}) {
+        directory = location();
+        Config seed(0, "tgnet.dat");
+        require(write(seed, "preserved-owner-and-auth"), "seed metadata/read failure");
+        std::filesystem::copy_file(directory / "tgnet.dat", directory / "tgnet.dat.bak");
+        inject("open_read", occurrence);
+        Config inaccessible(0, "tgnet.dat");
+        require(inaccessible.hasReadFailure() && !write(inaccessible, "overwrite"), "unreadable main or backup is not absence");
+        inject();
+        require(std::filesystem::exists(directory / "tgnet.dat") && std::filesystem::exists(directory / "tgnet.dat.bak"), "read error preserves both files");
+    }
+    directory = location();
+    Config statSeed(0, "tgnet.dat");
+    require(write(statSeed, "preserved-owner-and-auth"), "seed unknown metadata");
+    inject("stat");
+    Config unknownMetadata(0, "tgnet.dat");
+    require(unknownMetadata.hasReadFailure() && !write(unknownMetadata, "overwrite"), "unknown file metadata cannot initialize empty config");
+    inject();
+    directory = location();
+    rawFile(directory / "tgnet.dat", "bad");
+    rawFile(directory / "tgnet.dat.bak", "bad");
+    Config corrupt(0, "tgnet.dat");
+    require(corrupt.hasReadFailure() && read(corrupt).empty() && !write(corrupt, "overwrite"), "both corrupt files quarantine without overwrite");
+    require(std::filesystem::exists(directory / "tgnet.dat") && std::filesystem::exists(directory / "tgnet.dat.bak"), "corrupt evidence preserved");
+    directory = location();
+    rawFile(directory / "tgnet.dat", "bad");
+    Config corruptMain(0, "tgnet.dat");
+    require(read(corruptMain).empty() && corruptMain.hasReadFailure() && !write(corruptMain, "overwrite"), "invalid main alone fails closed");
+    for (uint32_t declaredSize : {uint32_t(128), uint32_t(0x80000000u)}) {
+        directory = location();
+        rawFile(directory / "tgnet.dat", std::string(reinterpret_cast<const char *>(&declaredSize), sizeof(declaredSize)) + "short");
+        Config truncated(0, "tgnet.dat");
+        require(read(truncated).empty() && truncated.hasReadFailure(), "truncated/overflow-size payload rejected without large allocation");
+    }
+}
+int main(int argc, char **argv) {
+    try {
+        require(argc == 2, "temporary data root required");
+        testPolicy();
+        testIO(std::filesystem::path(argv[1]));
+        std::printf("Native Config/policy: %u assertions passed (actual production code, disposable files, injected I/O faults)\n", assertions);
+#ifdef _WIN32
+        std::printf("Windows host: POSIX permissions/directory-fsync use test shims; Linux CI executes real POSIX calls.\n");
+#endif
+        return 0;
+    } catch (const std::exception &error) {
+        std::fprintf(stderr, "Native Config/policy failure: %s\n", error.what());
+        return 1;
+    }
+}

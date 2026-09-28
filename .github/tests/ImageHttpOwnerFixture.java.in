@@ -1,0 +1,201 @@
+import java.io.IOException;
+import java.io.InterruptedIOException;
+import java.lang.reflect.Modifier;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLConnection;
+import java.util.ArrayList;
+import java.util.List;
+
+/** Test-only Android boundary doubles. Production owner and redirect code is inserted below. */
+public final class ImageHttpOwnerFixture {
+    private static int assertions;
+
+    static final class UserConfig {
+        static final UserConfig instance = new UserConfig();
+        long generation = 11;
+        static UserConfig getInstance(int account) { return instance; }
+        long getSessionGeneration() { return generation; }
+        boolean isSessionGenerationCurrent(long expected) { return generation == expected; }
+    }
+
+    static final class AgramContainerManager {
+        static final AgramContainerManager instance = new AgramContainerManager();
+        static AgramContainerManager getInstance() { return instance; }
+        static final class ContainerRecord {
+            String id = "container-a";
+            boolean accessible = true;
+            boolean isStorageAccessible() { return accessible; }
+        }
+        ContainerRecord record = new ContainerRecord();
+        boolean metadataFailure;
+        // Deliberately instance-only: static calls in extracted production code must not compile.
+        ContainerRecord getContainer(int account) {
+            if (metadataFailure) throw new IllegalStateException("test metadata unavailable");
+            return record;
+        }
+    }
+
+    static final class FakeConnection extends HttpURLConnection {
+        final int status;
+        final String location;
+        boolean disconnected;
+        FakeConnection(URL url, int status, String location) {
+            super(url);
+            this.status = status;
+            this.location = location;
+        }
+        public void connect() { }
+        public void disconnect() { disconnected = true; }
+        public boolean usingProxy() { return false; }
+        public int getResponseCode() {
+            if (AgramNetworkController.revokeOnResponse) AgramNetworkController.direct = false;
+            return status;
+        }
+        public String getHeaderField(String key) {
+            if ("Location".equals(key)) return location;
+            if ("Set-Cookie".equals(key)) return "secret=must-not-forward";
+            return null;
+        }
+    }
+
+    static final class AgramNetworkController {
+        static boolean direct = true;
+        static boolean revokeOnResponse;
+        static int[] statuses;
+        static String[] locations;
+        static String passedId;
+        static long passedGeneration;
+        static final List<FakeConnection> opened = new ArrayList<>();
+        static boolean isDirectHttpOwnerCurrent(int account, String id, long generation) {
+            try {
+                AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(account);
+                return direct && account == 2 && record != null && record.isStorageAccessible()
+                        && record.id.equals(id) && UserConfig.getInstance(account).isSessionGenerationCurrent(generation);
+            } catch (RuntimeException unavailableMetadata) {
+                return false;
+            }
+        }
+        static URLConnection openDirectHttpConnection(int account, URL url, String id, long generation) throws IOException {
+            passedId = id;
+            passedGeneration = generation;
+            if (!isDirectHttpOwnerCurrent(account, id, generation)) throw new IOException("stale owner");
+            int index = opened.size();
+            FakeConnection connection = new FakeConnection(url, statuses[index], locations[index]);
+            opened.add(connection);
+            return connection;
+        }
+    }
+
+    /* PRODUCTION_OWNER */
+
+    private static void require(boolean condition, String description) {
+        assertions++;
+        if (!condition) throw new AssertionError(description);
+    }
+
+    private static void reset(int[] statuses, String... locations) {
+        UserConfig.instance.generation = 11;
+        AgramContainerManager.instance.record = new AgramContainerManager.ContainerRecord();
+        AgramContainerManager.instance.metadataFailure = false;
+        AgramNetworkController.direct = true;
+        AgramNetworkController.revokeOnResponse = false;
+        AgramNetworkController.statuses = statuses;
+        AgramNetworkController.locations = locations;
+        AgramNetworkController.opened.clear();
+    }
+
+    private static URL start() throws Exception { return new URL("https://a.example.invalid/start"); }
+
+    private static void testOwnerLifecycle() throws Exception {
+        reset(new int[] {200}, (String) null);
+        HttpTaskOwner captured = new HttpTaskOwner(2);
+        require(captured.isCurrent() && captured.isSessionCurrent(), "initial owner");
+        require(Modifier.isFinal(HttpTaskOwner.class.getDeclaredField("containerId").getModifiers()), "immutable id field");
+        require(Modifier.isFinal(HttpTaskOwner.class.getDeclaredField("generation").getModifiers()), "immutable generation field");
+        AgramNetworkController.direct = false;
+        require(!captured.isCurrent() && captured.isSessionCurrent(), "proxy blocks HTTP, not session identity");
+        AgramNetworkController.direct = true;
+        UserConfig.instance.generation++;
+        require(!captured.isCurrent() && !captured.isSessionCurrent(), "same-id replacement generation rejected");
+        HttpTaskOwner replacement = new HttpTaskOwner(2);
+        require(replacement.isCurrent(), "new generation accepted");
+        AgramContainerManager.instance.record.id = "container-b";
+        require(!replacement.isCurrent() && !replacement.isSessionCurrent(), "reused account slot rejected");
+        try {
+            captured.open(start());
+            throw new AssertionError("stale owner opened transport");
+        } catch (IOException expected) { }
+        require("container-a".equals(AgramNetworkController.passedId) && AgramNetworkController.passedGeneration == 11,
+                "open retains original binding, never recaptures replacement");
+        require(AgramNetworkController.opened.isEmpty(), "stale open has no connection");
+        HttpTaskOwner latest = new HttpTaskOwner(2);
+        AgramContainerManager.instance.record.accessible = false;
+        require(!latest.isCurrent() && !latest.isSessionCurrent(), "locked storage denied");
+        AgramContainerManager.instance.record = null;
+        require(!latest.isCurrent() && !latest.isSessionCurrent(), "removed container denied");
+        AgramContainerManager.instance.metadataFailure = true;
+        require(!latest.isCurrent() && !latest.isSessionCurrent(), "metadata exceptions fail closed");
+        HttpTaskOwner unavailable = new HttpTaskOwner(2);
+        require(unavailable.containerId == null && !unavailable.isCurrent(), "construction with failed metadata fails closed");
+    }
+
+    private static void blocked(String location, String reason) throws Exception {
+        reset(new int[] {302}, location);
+        try {
+            new HttpTaskOwner(2).openGet(start(), "safe-agent");
+            throw new AssertionError("not blocked: " + reason);
+        } catch (HttpRedirectException expected) {
+            require(expected.getMessage().contains(reason), expected.getMessage());
+        }
+        require(AgramNetworkController.opened.size() == 1 && AgramNetworkController.opened.get(0).disconnected,
+                "blocked redirect closes old connection without opening another");
+    }
+
+    private static void testRedirects() throws Exception {
+        reset(new int[] {302, 307, 200}, "/next", "https://b.example.invalid/image", null);
+        HttpURLConnection result = new HttpTaskOwner(2).openGet(start(), "safe-agent");
+        require(AgramNetworkController.opened.size() == 3, "relative and cross-host redirects followed");
+        require("https://a.example.invalid/next".equals(AgramNetworkController.opened.get(1).getURL().toString()), "relative Location resolution");
+        for (FakeConnection connection : AgramNetworkController.opened) {
+            require("GET".equals(connection.getRequestMethod()) && !connection.getInstanceFollowRedirects(), "GET with auto-redirect disabled");
+            require(connection.getConnectTimeout() == 5000 && connection.getReadTimeout() == 5000, "timeouts retained per hop");
+            require(connection.getRequestProperties().size() == 1 && "safe-agent".equals(connection.getRequestProperty("User-Agent")), "only safe UA header retained");
+            require(connection.getRequestProperty("Cookie") == null && connection.getRequestProperty("Authorization") == null,
+                    "server cookies and credentials never forwarded");
+        }
+        require(AgramNetworkController.opened.get(0).disconnected && AgramNetworkController.opened.get(1).disconnected
+                && !((FakeConnection) result).disconnected, "only final connection remains available");
+        reset(new int[] {301, 302, 303, 307, 308, 200}, "/1", "/2", "/3", "/4", "/5", null);
+        new HttpTaskOwner(2).openGet(new URL("http://a.example.invalid/start"), null);
+        require(AgramNetworkController.opened.size() == 6, "all five redirect codes and exactly five redirects supported");
+        reset(new int[] {302, 302, 302, 302, 302, 302}, "/1", "/2", "/3", "/4", "/5", "/6");
+        try {
+            new HttpTaskOwner(2).openGet(start(), null);
+            throw new AssertionError("sixth redirect followed");
+        } catch (HttpRedirectException expected) {
+            require(expected.getMessage().contains("more than 5 redirects"), "explicit redirect-limit reason");
+        }
+        require(AgramNetworkController.opened.size() == 6, "no seventh connection");
+        for (FakeConnection connection : AgramNetworkController.opened) require(connection.disconnected, "limit disconnects all hops");
+        blocked("http://a.example.invalid/unsafe", "HTTPS downgrade");
+        blocked("ftp://b.example.invalid/image", "unsupported scheme");
+        blocked("https://secret@b.example.invalid/image", "URL credentials");
+        blocked(null, "missing Location");
+        blocked("https://[invalid", "malformed Location");
+        reset(new int[] {302}, "/later");
+        AgramNetworkController.revokeOnResponse = true;
+        try {
+            new HttpTaskOwner(2).openGet(start(), null);
+            throw new AssertionError("revoked owner followed redirect");
+        } catch (InterruptedIOException expected) { }
+        require(AgramNetworkController.opened.size() == 1 && AgramNetworkController.opened.get(0).disconnected,
+                "owner revocation stops before next hop");
+    }
+
+    public static void main(String[] args) throws Exception {
+        testOwnerLifecycle();
+        testRedirects();
+        System.out.println("ImageHttpOwnerFixture: " + assertions + " assertions passed (production extraction, fake transport, no network)");
+    }
+}

@@ -57,7 +57,11 @@ public class AgramPushService extends Service {
         service.accountCount = accounts;
         NotificationManager manager = service.getSystemService(NotificationManager.class);
         if (manager != null) {
-            manager.notify(NOTIFICATION_ID, service.buildNotification());
+            try {
+                manager.notify(NOTIFICATION_ID, service.buildNotification());
+            } catch (RuntimeException error) {
+                FileLog.e("Unable to update Agram Push foreground notification");
+            }
         }
     }
 
@@ -80,8 +84,8 @@ public class AgramPushService extends Service {
         PendingIntent pendingIntent = PendingIntent.getActivity(
                 this, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         String text = accountCount > 0
-                ? "Защищённая доставка включена · контейнеров: " + accountCount
-                : "Запуск защищённой доставки";
+                ? "Фоновые соединения для уведомлений"
+                : "Подготовка фонового соединения";
         return new Notification.Builder(this, CHANNEL_ID)
                 .setSmallIcon(R.drawable.notification)
                 .setContentTitle("Agram Push")

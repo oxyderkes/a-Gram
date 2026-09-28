@@ -4493,7 +4493,7 @@ public class MediaDataController extends BaseController {
             loadMedia(dialogId, count, max_id, min_id, type, topicId, 0, classGuid, requestIndex, null, null);
         } else {
             if (fromCache == 0) {
-                ImageLoader.saveMessagesThumbs(res.messages);
+                ImageLoader.saveMessagesThumbs(currentAccount, res.messages);
                 getMessagesStorage().putUsersAndChats(res.users, res.chats, true, true);
                 putMediaDatabase(dialogId, topicId, type, res.messages, max_id, min_id, topReached);
             }
@@ -6106,7 +6106,7 @@ public class MediaDataController extends BaseController {
                             removeEmptyMessages(messagesRes.messages);
                             if (!messagesRes.messages.isEmpty()) {
                                 TLRPC.Chat chat = getMessagesController().getChat(channelId);
-                                ImageLoader.saveMessagesThumbs(messagesRes.messages);
+                                ImageLoader.saveMessagesThumbs(currentAccount, messagesRes.messages);
                                 broadcastPinnedMessage(messagesRes.messages, messagesRes.users, messagesRes.chats, false, false);
                                 getMessagesStorage().putUsersAndChats(messagesRes.users, messagesRes.chats, true, true);
                                 savePinnedMessages(dialogId, messagesRes.messages);
@@ -6126,7 +6126,7 @@ public class MediaDataController extends BaseController {
                             TLRPC.messages_Messages messagesRes = (TLRPC.messages_Messages) response;
                             removeEmptyMessages(messagesRes.messages);
                             if (!messagesRes.messages.isEmpty()) {
-                                ImageLoader.saveMessagesThumbs(messagesRes.messages);
+                                ImageLoader.saveMessagesThumbs(currentAccount, messagesRes.messages);
                                 broadcastPinnedMessage(messagesRes.messages, messagesRes.users, messagesRes.chats, false, false);
                                 getMessagesStorage().putUsersAndChats(messagesRes.users, messagesRes.chats, true, true);
                                 savePinnedMessages(dialogId, messagesRes.messages);
@@ -6647,7 +6647,7 @@ public class MediaDataController extends BaseController {
                                                         }
                                                     }
                                                     MessageObject.fixMessagePeer(messagesRes.messages, channelId);
-                                                    ImageLoader.saveMessagesThumbs(messagesRes.messages);
+                                                    ImageLoader.saveMessagesThumbs(currentAccount, messagesRes.messages);
                                                     broadcastReplyMessages(messagesRes.messages, replyMessageOwners, messagesRes.users, messagesRes.chats, dialogId, false);
                                                     getMessagesStorage().putUsersAndChats(messagesRes.users, messagesRes.chats, true, true);
                                                     saveReplyMessages(replyMessageOwners, messagesRes.messages, scheduled);
@@ -6661,7 +6661,7 @@ public class MediaDataController extends BaseController {
                                                 }
                                             }
                                             MessageObject.fixMessagePeer(messagesRes.messages, channelId);
-                                            ImageLoader.saveMessagesThumbs(messagesRes.messages);
+                                            ImageLoader.saveMessagesThumbs(currentAccount, messagesRes.messages);
                                             broadcastReplyMessages(messagesRes.messages, replyMessageOwners, messagesRes.users, messagesRes.chats, dialogId, false);
                                             getMessagesStorage().putUsersAndChats(messagesRes.users, messagesRes.chats, true, true);
                                             saveReplyMessages(replyMessageOwners, messagesRes.messages, scheduled);
@@ -6694,7 +6694,7 @@ public class MediaDataController extends BaseController {
                                             }
                                         }
                                         MessageObject.fixMessagePeer(messagesRes.messages, channelId);
-                                        ImageLoader.saveMessagesThumbs(messagesRes.messages);
+                                        ImageLoader.saveMessagesThumbs(currentAccount, messagesRes.messages);
                                         broadcastReplyMessages(messagesRes.messages, replyMessageOwners, messagesRes.users, messagesRes.chats, dialogId, false);
                                         getMessagesStorage().putUsersAndChats(messagesRes.users, messagesRes.chats, true, true);
                                         saveReplyMessages(replyMessageOwners, messagesRes.messages, scheduled);
@@ -6724,7 +6724,7 @@ public class MediaDataController extends BaseController {
                                                 message.dialog_id = dialogId;
                                             }
                                         }
-                                        ImageLoader.saveMessagesThumbs(messagesRes.messages);
+                                        ImageLoader.saveMessagesThumbs(currentAccount, messagesRes.messages);
                                         broadcastReplyMessages(messagesRes.messages, replyMessageOwners, messagesRes.users, messagesRes.chats, dialogId, false);
                                         getMessagesStorage().putUsersAndChats(messagesRes.users, messagesRes.chats, true, true);
                                         saveReplyMessages(replyMessageOwners, messagesRes.messages, scheduled);

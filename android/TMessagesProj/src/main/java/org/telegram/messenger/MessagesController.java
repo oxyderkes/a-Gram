@@ -805,10 +805,10 @@ public class MessagesController extends BaseController implements NotificationCe
                 }
                 cursor.dispose();
                 if (messageId != 0) {
-                    if (isReactions) {
+                    if (isReactions && !shouldSuppressAutomaticRead(dialogId, false)) {
                         getMessagesStorage().markMessageReactionsAsRead(dialogId, topicId, messageId);
                     }
-                    if (isVotes) {
+                    if (isVotes && !shouldSuppressAutomaticRead(dialogId, false)) {
                         getMessagesStorage().markMessagePollVotesAsRead(dialogId, topicId, messageId);
                     }
                     int finalMessageId = messageId;
@@ -1543,7 +1543,11 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     public boolean isKeepDeletedMessagesEnabled() {
-        return mainPreferences.getBoolean(AGRAM_KEEP_DELETED_MESSAGES, false);
+        return AgramContainerManager.getInstance().isKeepDeletedMessagesEnabled(currentAccount);
+    }
+
+    public boolean setKeepDeletedMessagesEnabled(boolean enabled, String expectedContainerId, long expectedGeneration) {
+        return getUserConfig().setKeepDeletedMessagesEnabled(enabled, expectedContainerId, expectedGeneration);
     }
 
     public static SharedPreferences getNotificationsSettings(int account) {
@@ -2216,7 +2220,7 @@ public class MessagesController extends BaseController implements NotificationCe
             }
 
             if (pinnedRemoteDialogs != null && !pinnedRemoteDialogs.dialogs.isEmpty()) {
-                ImageLoader.saveMessagesThumbs(pinnedRemoteDialogs.messages);
+                ImageLoader.saveMessagesThumbs(currentAccount, pinnedRemoteDialogs.messages);
                 for (int a = 0; a < pinnedRemoteDialogs.messages.size(); a++) {
                     TLRPC.Message message = pinnedRemoteDialogs.messages.get(a);
                     if (message.action instanceof TLRPC.TL_messageActionChatDeleteUser) {
@@ -7973,7 +7977,7 @@ public class MessagesController extends BaseController implements NotificationCe
                     objects.add(new MessageObject(currentAccount, message, usersLocal, chatsLocal, true, true));
                 }
 
-                ImageLoader.saveMessagesThumbs(messagesRes.messages);
+                ImageLoader.saveMessagesThumbs(currentAccount, messagesRes.messages);
                 getMessagesStorage().putMessages(messagesRes, dialogId, -1, 0, false, mode, 0);
 
                 AndroidUtilities.runOnUIThread(() -> {
@@ -9060,7 +9064,7 @@ public class MessagesController extends BaseController implements NotificationCe
         if (location == null) {
             return;
         }
-        uploadingAvatar = FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE) + "/" + location.volume_id + "_" + location.local_id + ".jpg";
+        uploadingAvatar = FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_CACHE) + "/" + location.volume_id + "_" + location.local_id + ".jpg";
         getFileLoader().uploadFile(uploadingAvatar, false, true, ConnectionsManager.FileTypePhoto);
     }
 
@@ -11938,7 +11942,7 @@ public class MessagesController extends BaseController implements NotificationCe
                         for (int a = 0; a < arrayList1.size(); a++) {
                             arrayList1.get(a).messageOwner.media.webpage = media.webpage;
                             if (a == 0) {
-                                ImageLoader.saveMessageThumbs(arrayList1.get(a).messageOwner);
+                                ImageLoader.saveMessageThumbs(currentAccount, arrayList1.get(a).messageOwner);
                             }
                             messagesRes.messages.add(arrayList1.get(a).messageOwner);
                         }
@@ -12042,7 +12046,7 @@ public class MessagesController extends BaseController implements NotificationCe
             }
         }
         if (!isCache) {
-            ImageLoader.saveMessagesThumbs(messagesRes.messages);
+            ImageLoader.saveMessagesThumbs(currentAccount, messagesRes.messages);
         }
         final boolean isInitialLoading = offset_date == 0 && max_id == 0;
         final boolean reload;
@@ -13064,7 +13068,7 @@ public class MessagesController extends BaseController implements NotificationCe
                 dialogs_read_outbox_max.put(d.id, Math.max(value, d.read_outbox_max_id));
             }
 
-            ImageLoader.saveMessagesThumbs(resetDialogsAll.messages);
+            ImageLoader.saveMessagesThumbs(currentAccount, resetDialogsAll.messages);
             for (int a = 0; a < resetDialogsAll.messages.size(); a++) {
                 TLRPC.Message message = resetDialogsAll.messages.get(a);
                 if (message.action instanceof TLRPC.TL_messageActionChatDeleteUser) {
@@ -13617,7 +13621,7 @@ public class MessagesController extends BaseController implements NotificationCe
             }
 
             if (loadType != DIALOGS_LOAD_TYPE_CACHE) {
-                ImageLoader.saveMessagesThumbs(dialogsRes.messages);
+                ImageLoader.saveMessagesThumbs(currentAccount, dialogsRes.messages);
 
                 for (int a = 0; a < dialogsRes.messages.size(); a++) {
                     TLRPC.Message message = dialogsRes.messages.get(a);
@@ -14483,8 +14487,30 @@ public class MessagesController extends BaseController implements NotificationCe
         }
     }
 
+    private boolean shouldSuppressAutomaticRead(long dialogId, boolean explicit) {
+        return AgramGhostReadPolicy.suppressAutomaticRead(
+                AgramContainerManager.getInstance().shouldSuppressReadReceipt(currentAccount),
+                DialogObject.isEncryptedDialog(dialogId), explicit);
+    }
+
+    public boolean shouldSuppressContentRead(MessageObject messageObject) {
+        if (messageObject == null || messageObject.messageOwner == null) {
+            return false;
+        }
+        TLRPC.Message message = messageObject.messageOwner;
+        TLRPC.MessageMedia media = MessageObject.getMedia(message);
+        return AgramGhostReadPolicy.suppressContentRead(
+                AgramContainerManager.getInstance().shouldSuppressReadReceipt(currentAccount),
+                DialogObject.isEncryptedDialog(messageObject.getDialogId())
+                        || message instanceof TLRPC.TL_message_secret,
+                message.ttl, media == null ? 0 : media.ttl_seconds);
+    }
+
     public void markMessageContentAsRead(MessageObject messageObject) {
         if (messageObject.scheduled) {
+            return;
+        }
+        if (shouldSuppressContentRead(messageObject)) {
             return;
         }
         ArrayList<Integer> arrayList = new ArrayList<>();
@@ -14522,6 +14548,22 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     public void markMentionMessageAsRead(int mid, long channelId, long did) {
+        if (shouldSuppressAutomaticRead(did, false)) {
+            return;
+        }
+        markMentionMessageAsReadInternal(mid, channelId, did);
+    }
+
+    public void markMentionMessageAsRead(MessageObject messageObject) {
+        if (messageObject == null || messageObject.messageOwner == null
+                || shouldSuppressContentRead(messageObject)) {
+            return;
+        }
+        markMentionMessageAsReadInternal(messageObject.getId(),
+                messageObject.messageOwner.peer_id.channel_id, messageObject.getDialogId());
+    }
+
+    private void markMentionMessageAsReadInternal(int mid, long channelId, long did) {
         getMessagesStorage().markMentionMessageAsRead(-channelId, mid, did);
         if (channelId != 0) {
             TLRPC.TL_channels_readMessageContents req = new TLRPC.TL_channels_readMessageContents();
@@ -16205,7 +16247,7 @@ public class MessagesController extends BaseController implements NotificationCe
                         src.renameTo(destFile);
                         String oldKey = smallSize.volume_id + "_" + smallSize.local_id + "@50_50";
                         String newKey = small.location.volume_id + "_" + small.location.local_id + "@50_50";
-                        ImageLoader.getInstance().replaceImageInCache(oldKey, newKey, ImageLocation.getForPhoto(small, photo), true);
+                        ImageLoader.getInstance().replaceImageInCache(currentAccount, oldKey, newKey, ImageLocation.getForPhoto(small, photo), true);
                     }
                     TLRPC.PhotoSize big = FileLoader.getClosestPhotoSizeWithSize(photo.sizes, 800);
                     if (big != null && bigSize != null) {
@@ -16233,20 +16275,9 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     public void unregistedPush() {
-        if (getUserConfig().registeredForPush && SharedConfig.pushString.length() == 0) {
-            TL_account.unregisterDevice req = new TL_account.unregisterDevice();
-            req.token = SharedConfig.pushString;
-            req.token_type = SharedConfig.pushType;
-            for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
-                UserConfig userConfig = UserConfig.getInstance(a);
-                if (a != currentAccount && userConfig.isClientActivated()) {
-                    req.other_uids.add(userConfig.getClientUserId());
-                }
-            }
-            getConnectionsManager().sendRequest(req, (response, error) -> {
-
-            });
-        }
+        // Agram never sends a shared token or sibling account IDs, including
+        // during logout. Per-container endpoints use unregisterAgramPush.
+        getUserConfig().registeredForPush = false;
     }
 
     public void performLogout(int type) {
@@ -16254,28 +16285,32 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     public void performLogout(int type, boolean preserveBlockedAccount) {
-        AgramPushController.getInstance().unregisterAccount(currentAccount, true);
-        if (type == 1) {
-            unregistedPush();
-            TLRPC.TL_auth_logOut req = new TLRPC.TL_auth_logOut();
-            getConnectionsManager().sendRequest(req, (response, error) -> {
-                getConnectionsManager().cleanup(false);
-                AndroidUtilities.runOnUIThread(() -> {
-                    if (response instanceof TLRPC.TL_auth_loggedOut) {
-                        if (((TLRPC.TL_auth_loggedOut) response).future_auth_token != null) {
-                            AuthTokensHelper.addLogOutToken((TLRPC.TL_auth_loggedOut) response);
-                        }
-                    }
-                });
-            });
-        } else {
-            getConnectionsManager().cleanup(type == 2);
+        final long leavingGeneration = getUserConfig().getSessionGeneration();
+        final AgramContainerManager manager = AgramContainerManager.getInstance();
+        final AgramContainerManager.ContainerRecord leaving = manager.getContainer(currentAccount);
+        final String leavingContainerId = leaving == null ? null : leaving.id;
+        final ConnectionsManager connections = getConnectionsManager();
+        // Persist an explicit recovery intent before clearing the user. A failed
+        // clear leaves its user bytes intact, so startup cannot act on the intent.
+        boolean retirementPrepared;
+        try {
+            retirementPrepared = manager.prepareNativeRetirement(currentAccount, leavingContainerId);
+        } catch (RuntimeException unavailable) {
+            retirementPrepared = false;
         }
-        getUserConfig().clearConfig(preserveBlockedAccount);
-        // A Telegram account owns its container for exactly the lifetime of
-        // that session. A later login in the freed engine slot receives a new
-        // random container id, Keystore key, push instance and device profile.
-        AgramContainerManager.getInstance().deleteContainer(currentAccount);
+        // Do not revoke native keys, stop push, or retire a container before the
+        // local logout decision is durable. Disk/Keystore failures are retryable.
+        if (!retirementPrepared || !getUserConfig().clearConfig(preserveBlockedAccount, leavingGeneration)) {
+            FileLog.e("Preserving Agram container because account config cleanup was not durable for " + currentAccount);
+            getNotificationCenter().postNotificationName(
+                    NotificationCenter.agramContainerPersistenceFailed,
+                    currentAccount,
+                    "logout");
+            return;
+        }
+        final long retiredGeneration = getUserConfig().getSessionGeneration();
+        AgramPushController.getInstance().unregisterAccount(currentAccount, leavingContainerId, true);
+        final Runnable finishLogout = () -> {
         SharedPrefsHelper.cleanupAccount(currentAccount);
 
         boolean shouldHandle = true;
@@ -16298,12 +16333,21 @@ public class MessagesController extends BaseController implements NotificationCe
                     }
                 }
                 if (account != -1) {
-                    UserConfig.setSelectedAccountPersisted(account);
-                    if (LaunchActivity.instance != null) {
+                    if (!UserConfig.setSelectedAccountPersisted(account)) {
+                        getNotificationCenter().postNotificationName(
+                                NotificationCenter.agramContainerPersistenceFailed,
+                                currentAccount,
+                                "selected_account");
+                    } else if (LaunchActivity.instance != null) {
                         LaunchActivity.instance.clearFragments();
                     }
                 } else {
-                    UserConfig.setSelectedAccountPersisted(UserConfig.getLoginTargetAccount());
+                    if (!UserConfig.setSelectedAccountPersisted(UserConfig.getLoginTargetAccount())) {
+                        getNotificationCenter().postNotificationName(
+                                NotificationCenter.agramContainerPersistenceFailed,
+                                currentAccount,
+                                "selected_account");
+                    }
                 }
             }
         }
@@ -16311,49 +16355,34 @@ public class MessagesController extends BaseController implements NotificationCe
         getMessagesStorage().cleanup(false);
         cleanup();
         getContactsController().deleteUnknownAppAccounts();
+        };
+        final Runnable retire = () -> connections.retireAgramContainer(
+                leavingContainerId, retiredGeneration, finishLogout);
+        if (type == 1) {
+            TLRPC.TL_auth_logOut req = new TLRPC.TL_auth_logOut();
+            connections.sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
+                if (!getUserConfig().isSessionGenerationCurrent(retiredGeneration)
+                        || getUserConfig().hasPersistedSession()
+                        || !manager.isCurrentContainer(currentAccount, leavingContainerId)) return;
+                if (response instanceof TLRPC.TL_auth_loggedOut
+                        && ((TLRPC.TL_auth_loggedOut) response).future_auth_token != null) {
+                    AuthTokensHelper.addLogOutToken((TLRPC.TL_auth_loggedOut) response);
+                }
+                retire.run();
+            }));
+            // Explicit local logout remains possible offline. No old keys or
+            // queued WithoutLogin requests may survive this retirement barrier.
+            AndroidUtilities.runOnUIThread(retire, 5_000);
+        } else {
+            retire.run();
+        }
     }
 
     public void registerForPush(@PushListenerController.PushType int pushType, String regid) {
-        if (TextUtils.isEmpty(regid) || registeringForPush || getUserConfig().getClientUserId() == 0) {
-            return;
-        }
-        if (getUserConfig().registeredForPush && regid.equals(SharedConfig.pushString)) {
-            return;
-        }
-        registeringForPush = true;
-        lastPushRegisterSendTime = SystemClock.elapsedRealtime();
-        if (SharedConfig.pushAuthKey == null) {
-            SharedConfig.pushAuthKey = new byte[256];
-            Utilities.random.nextBytes(SharedConfig.pushAuthKey);
-            SharedConfig.saveConfig();
-        }
-        TL_account.registerDevice req = new TL_account.registerDevice();
-        req.token_type = pushType;
-        req.token = regid;
-        req.no_muted = false;
-        req.secret = SharedConfig.pushAuthKey;
-        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
-            UserConfig userConfig = UserConfig.getInstance(a);
-            if (a != currentAccount && userConfig.isClientActivated()) {
-                long uid = userConfig.getClientUserId();
-                req.other_uids.add(uid);
-                if (BuildVars.LOGS_ENABLED) {
-                    FileLog.d("add other uid = " + uid + " for account " + currentAccount);
-                }
-            }
-        }
-        getConnectionsManager().sendRequest(req, (response, error) -> {
-            if (response instanceof TLRPC.TL_boolTrue) {
-                if (BuildVars.LOGS_ENABLED) {
-                    FileLog.d("account " + currentAccount + " registered for push, push type: " + pushType);
-                }
-                getUserConfig().registeredForPush = true;
-                SharedConfig.pushString = regid;
-                SharedConfig.pushType = pushType;
-                getUserConfig().saveConfig(false);
-            }
-            AndroidUtilities.runOnUIThread(() -> registeringForPush = false);
-        });
+        // Covers getDifference, logout/relogin and delayed provider callbacks.
+        // Do not consult other accounts or construct a legacy registerDevice.
+        registeringForPush = false;
+        getUserConfig().registeredForPush = false;
     }
 
     /** Registers the per-container Simple Push endpoint documented by Telegram. */
@@ -16361,6 +16390,14 @@ public class MessagesController extends BaseController implements NotificationCe
         if (TextUtils.isEmpty(endpoint) || getUserConfig().getClientUserId() == 0) {
             return;
         }
+        AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(currentAccount);
+        if (record == null || !record.isStorageAccessible()
+                || !AgramContainerManager.PUSH_AGRAM.equals(record.pushMode)
+                || !endpoint.equals(record.agramPushEndpoint)) return;
+        final String containerId = record.id;
+        final long pushSessionGeneration = getUserConfig().getSessionGeneration();
+        final AgramPushState.Binding binding = AgramPushState.bind(currentAccount, containerId, endpoint);
+        if (!AgramPushState.beginRegistration(binding, System.currentTimeMillis())) return;
         TL_account.registerDevice req = new TL_account.registerDevice();
         req.token_type = 4;
         req.token = endpoint;
@@ -16370,13 +16407,15 @@ public class MessagesController extends BaseController implements NotificationCe
         // Every Agram container owns a different endpoint. Do not merge users
         // through other_uids, which would defeat container isolation.
         getConnectionsManager().sendRequest(req, (response, error) -> {
-            if (response instanceof TLRPC.TL_boolTrue) {
-                AgramContainerManager.getInstance().saveAgramPushEndpoint(
-                        currentAccount, endpoint, "registered");
-            } else {
-                AgramContainerManager.getInstance().saveAgramPushEndpoint(
-                        currentAccount, endpoint, "telegram_error");
-            }
+            AgramContainerManager.ContainerRecord current = AgramContainerManager.getInstance().getContainer(currentAccount);
+            if (current == null || !containerId.equals(current.id)
+                    || !getUserConfig().isSessionGenerationCurrent(pushSessionGeneration)
+                    || !getUserConfig().isClientActivated()
+                    || !endpoint.equals(current.agramPushEndpoint)
+                    || !AgramContainerManager.PUSH_AGRAM.equals(current.pushMode)) return;
+            // Runtime status is independent from the HTTPS stream and never rewrites metadata.
+            AgramPushState.registration(binding, response instanceof TLRPC.TL_boolTrue,
+                    error == null ? "Неожиданный ответ Telegram" : "Telegram: ошибка " + error.code);
         });
     }
 
@@ -16894,7 +16933,7 @@ public class MessagesController extends BaseController implements NotificationCe
                         if (res instanceof TLRPC.TL_updates_channelDifference || res instanceof TLRPC.TL_updates_channelDifferenceEmpty) {
                             if (!res.new_messages.isEmpty()) {
                                 LongSparseArray<ArrayList<MessageObject>> messages = new LongSparseArray<>();
-                                ImageLoader.saveMessagesThumbs(res.new_messages);
+                                ImageLoader.saveMessagesThumbs(currentAccount, res.new_messages);
 
                                 ArrayList<MessageObject> pushMessages = new ArrayList<>();
                                 long dialogId = -channelId;
@@ -17158,7 +17197,7 @@ public class MessagesController extends BaseController implements NotificationCe
                                     }
                                 }
 
-                                ImageLoader.saveMessagesThumbs(res.new_messages);
+                                ImageLoader.saveMessagesThumbs(currentAccount, res.new_messages);
 
                                 ArrayList<MessageObject> pushMessages = new ArrayList<>();
                                 long clientUserId = getUserConfig().getClientUserId();
@@ -18745,7 +18784,7 @@ public class MessagesController extends BaseController implements NotificationCe
                     }
                 }
 
-                ImageLoader.saveMessageThumbs(message);
+                ImageLoader.saveMessageThumbs(currentAccount, message);
 
                 MessageObject.getDialogId(message);
                 if (baseUpdate instanceof TL_update.TL_updateNewChannelMessage && message.reply_to != null && !(message.action instanceof TLRPC.TL_messageActionPinMessage)) {
@@ -18770,7 +18809,7 @@ public class MessagesController extends BaseController implements NotificationCe
                 }
 
                 if (createdDialogIds.contains(message.dialog_id) && message.grouped_id == 0) {
-                    ImageLoader.MessageThumb messageThumb = ImageLoader.generateMessageThumb(message);
+                    ImageLoader.MessageThumb messageThumb = ImageLoader.generateMessageThumb(currentAccount, message);
                     if (messageThumb != null) {
                         if (messageThumbs == null) {
                             messageThumbs = new ArrayList<>();
@@ -19267,7 +19306,7 @@ public class MessagesController extends BaseController implements NotificationCe
                     }
                     for (int a = 0, size = decryptedMessages.size(); a < size; a++) {
                         TLRPC.Message message = decryptedMessages.get(a);
-                        ImageLoader.saveMessageThumbs(message);
+                        ImageLoader.saveMessageThumbs(currentAccount, message);
                         if (messagesArr == null) {
                             messagesArr = new ArrayList<>();
                         }
@@ -19650,7 +19689,7 @@ public class MessagesController extends BaseController implements NotificationCe
                     message.attachPath = "";
                 }
 
-                ImageLoader.saveMessageThumbs(message);
+                ImageLoader.saveMessageThumbs(currentAccount, message);
                 AndroidUtilities.runOnUIThread(()-> getSendMessagesHelper().onMessageEdited(message));
 
                 boolean isDialogCreated = createdDialogIds.contains(message.dialog_id);
@@ -21002,7 +21041,7 @@ public class MessagesController extends BaseController implements NotificationCe
                                     arrayList.get(a).messageOwner.media.webpage = webpage;
                                     if (a == 0) {
                                         dialogId = arrayList.get(a).getDialogId();
-                                        ImageLoader.saveMessageThumbs(arrayList.get(a).messageOwner);
+                                        ImageLoader.saveMessageThumbs(currentAccount, arrayList.get(a).messageOwner);
                                     }
                                     arr.add(arrayList.get(a).messageOwner);
                                 }
@@ -21155,7 +21194,7 @@ public class MessagesController extends BaseController implements NotificationCe
             }
 
             if (updateMessageThumbs != null) {
-                ImageLoader.getInstance().putThumbsToCache(updateMessageThumbs);
+                ImageLoader.getInstance().putThumbsToCache(currentAccount, updateMessageThumbs);
             }
         });
 
@@ -21164,6 +21203,7 @@ public class MessagesController extends BaseController implements NotificationCe
         LongSparseArray<ArrayList<Integer>> markContentAsReadMessagesFinal = markContentAsReadMessages;
         SparseIntArray markAsReadEncryptedFinal = markAsReadEncrypted;
         LongSparseArray<ArrayList<Integer>> deletedMessagesFinal = deletedMessages;
+        final boolean keepDeletedMessages = deletedMessagesFinal != null && isKeepDeletedMessagesEnabled();
         LongSparseArray<ArrayList<Integer>> deletedQuickRepliesMessagesFinal = deletedQuickReplyMessages;
         LongSparseArray<ArrayList<Integer>> scheduledDeletedMessagesFinal = scheduledDeletedMessages;
         LongSparseArray<ArrayList<Integer>> scheduledDeletedMessagesSentFinal = scheduledDeletedMessagesSent;
@@ -21250,7 +21290,7 @@ public class MessagesController extends BaseController implements NotificationCe
                     getNotificationCenter().postNotificationName(NotificationCenter.messagesReadContent, key, value);
                 }
             }
-            if (deletedMessagesFinal != null && !isKeepDeletedMessagesEnabled()) {
+            if (deletedMessagesFinal != null && !keepDeletedMessages) {
                 processServerDeletedMessagesInUi(deletedMessagesFinal);
             }
             if (deletedQuickRepliesMessagesFinal != null) {
@@ -21341,7 +21381,7 @@ public class MessagesController extends BaseController implements NotificationCe
                 ArrayList<Integer> arrayList = deletedMessages.valueAt(a);
                 getMessagesStorage().getStorageQueue().postRunnable(() -> {
                     ArrayList<Integer> messagesToDelete = arrayList;
-                    if (isKeepDeletedMessagesEnabled()) {
+                    if (keepDeletedMessages) {
                         ArrayList<Integer> keptMessages = getMessagesStorage().markMessagesDeletedOnServer(key, arrayList);
                         if (!keptMessages.isEmpty()) {
                             messagesToDelete = new ArrayList<>(arrayList);
@@ -21353,7 +21393,7 @@ public class MessagesController extends BaseController implements NotificationCe
                         final ArrayList<Integer> regularMessages = messagesToDelete;
                         ArrayList<Long> dialogIds = getMessagesStorage().markMessagesAsDeleted(key, regularMessages, false, true, 0, 0);
                         getMessagesStorage().updateDialogsWithDeletedMessages(key, -key, regularMessages, dialogIds);
-                        if (isKeepDeletedMessagesEnabled()) {
+                        if (keepDeletedMessages) {
                             LongSparseArray<ArrayList<Integer>> regularDeletions = new LongSparseArray<>();
                             regularDeletions.put(key, regularMessages);
                             AndroidUtilities.runOnUIThread(() -> processServerDeletedMessagesInUi(regularDeletions));
@@ -21695,6 +21735,17 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     public void markReactionsAsRead(long dialogId, long topicId) {
+        markReactionsAsRead(dialogId, topicId, false);
+    }
+
+    public void markReactionsAsReadExplicit(long dialogId, long topicId) {
+        markReactionsAsRead(dialogId, topicId, true);
+    }
+
+    private void markReactionsAsRead(long dialogId, long topicId, boolean explicit) {
+        if (shouldSuppressAutomaticRead(dialogId, explicit)) {
+            return;
+        }
         if (topicId == 0) {
             TLRPC.Dialog dialog = dialogs_dict.get(dialogId);
             if (dialog != null) {
@@ -21726,6 +21777,17 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     public void markPollVotesAsRead(long dialogId, long topicId) {
+        markPollVotesAsRead(dialogId, topicId, false);
+    }
+
+    public void markPollVotesAsReadExplicit(long dialogId, long topicId) {
+        markPollVotesAsRead(dialogId, topicId, true);
+    }
+
+    private void markPollVotesAsRead(long dialogId, long topicId, boolean explicit) {
+        if (shouldSuppressAutomaticRead(dialogId, explicit)) {
+            return;
+        }
         if (topicId == 0) {
             TLRPC.Dialog dialog = dialogs_dict.get(dialogId);
             if (dialog != null) {

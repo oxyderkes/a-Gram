@@ -34,7 +34,7 @@ public class AutoMessageHeardReceiver extends BroadcastReceiver {
                     AndroidUtilities.runOnUIThread(() -> {
                         accountInstance.getMessagesController().putUser(user1, true);
                         MessagesController.getInstance(currentAccount).markDialogAsReadExplicit(dialogId, maxId, maxId, 0, false, 0, 0, true, 0);
-                        MessagesController.getInstance(currentAccount).markReactionsAsRead(dialogId, 0);
+                        MessagesController.getInstance(currentAccount).markReactionsAsReadExplicit(dialogId, 0);
                     });
                 });
                 return;
@@ -47,13 +47,13 @@ public class AutoMessageHeardReceiver extends BroadcastReceiver {
                     AndroidUtilities.runOnUIThread(() -> {
                         accountInstance.getMessagesController().putChat(chat1, true);
                         MessagesController.getInstance(currentAccount).markDialogAsReadExplicit(dialogId, maxId, maxId, 0, false, 0, 0, true, 0);
-                        MessagesController.getInstance(currentAccount).markReactionsAsRead(dialogId, 0);
+                        MessagesController.getInstance(currentAccount).markReactionsAsReadExplicit(dialogId, 0);
                     });
                 });
                 return;
             }
         }
         MessagesController.getInstance(currentAccount).markDialogAsReadExplicit(dialogId, maxId, maxId, 0, false, 0, 0, true, 0);
-        MessagesController.getInstance(currentAccount).markReactionsAsRead(dialogId, 0);
+        MessagesController.getInstance(currentAccount).markReactionsAsReadExplicit(dialogId, 0);
     }
 }

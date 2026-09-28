@@ -1,4 +1,5 @@
 apply plugin: 'com.android.application'
+apply plugin: 'org.telegram.build-app-plugin'
 
 // Gradle's in-process javac leaks zipfs handles on Windows and can omit
 // same-module sources after the resulting AccessDeniedException. A short-lived
@@ -23,6 +24,8 @@ configurations {
 
 configurations.all {
     exclude group: 'com.google.firebase', module: 'firebase-core'
+    exclude group: 'com.google.firebase', module: 'firebase-messaging'
+    exclude group: 'com.google.firebase', module: 'firebase-iid'
     exclude group: 'androidx.recyclerview', module: 'recyclerview'
 }
 
@@ -37,6 +40,8 @@ dependencies {
 def agramReleaseStorePassword = System.getenv('AGRAM_RELEASE_STORE_PASSWORD') ?: (findProperty('RELEASE_STORE_PASSWORD') ?: '')
 def agramReleaseKeyPassword = System.getenv('AGRAM_RELEASE_KEY_PASSWORD') ?: (findProperty('RELEASE_KEY_PASSWORD') ?: '')
 def agramReleaseKeyAlias = System.getenv('AGRAM_RELEASE_KEY_ALIAS') ?: (findProperty('RELEASE_KEY_ALIAS') ?: 'manygram')
+// Explicit unsigned verification lane; never silently substitute a signing identity.
+def agramUnsignedBuild = providers.gradleProperty('AGRAM_UNSIGNED_BUILD').orNull == 'true'
 
 android {
     compileSdkVersion 36
@@ -60,7 +65,8 @@ android {
     }
 
     androidResources {
-        localeFilters += ["en", "ar", "de", "es", "it", "ko", "nl", "pt-rBR", "ru", "uk"]
+        noCompress += "pack"
+        localeFilters += ["zz"]
     }
 
     signingConfigs {
@@ -87,17 +93,18 @@ android {
             applicationIdSuffix ".debug"
             minifyEnabled false
             multiDexEnabled true
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), '../TMessagesProj/proguard-rules.pro', '../TMessagesProj/proguard-rules-beta.pro'
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), '../TMessagesProj/proguard-rules.pro'
             ndk.debugSymbolLevel = 'FULL'
         }
         standalone {
             matchingFallbacks = ['release']
             debuggable false
             jniDebuggable false
-            signingConfig signingConfigs.release
+            signingConfig agramUnsignedBuild ? null : signingConfigs.release
             minifyEnabled true
+            shrinkResources true
             multiDexEnabled true
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), '../TMessagesProj/proguard-rules.pro'
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), '../TMessagesProj/proguard-rules.pro'
             ndk.debugSymbolLevel = 'FULL'
         }
     }

@@ -38,6 +38,7 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import org.telegram.messenger.AccountInstance;
+import org.telegram.messenger.AgramContainerManager;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.BuildVars;
 import org.telegram.messenger.ContactsController;
@@ -171,6 +172,8 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
     private boolean deleteAccountUpdate;
     private boolean secretMapUpdate;
     private boolean currentSync;
+    private long sessionGeneration;
+    private String containerId;
     private boolean newSync;
     private boolean currentSuggest;
     private boolean newSuggest;
@@ -185,10 +188,13 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
     @Override
     public boolean onFragmentCreate() {
         super.onFragmentCreate();
+        sessionGeneration = getUserConfig().getSessionGeneration();
+        AgramContainerManager.ContainerRecord container = AgramContainerManager.getInstance().getContainer(currentAccount);
+        containerId = container != null ? container.id : null;
 
         getContactsController().loadPrivacySettings();
         getMessagesController().getBlockedPeers(true);
-        currentSync = newSync = getUserConfig().syncContacts;
+        currentSync = newSync = getUserConfig().isContactSyncAllowed();
         currentSuggest = newSuggest = getUserConfig().suggestContacts;
         TLRPC.GlobalPrivacySettings privacySettings = getContactsController().getGlobalPrivacySettings();
         if (privacySettings != null) {
@@ -237,11 +243,11 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
         getNotificationCenter().removeObserver(this, NotificationCenter.blockedUsersDidLoad);
         getNotificationCenter().removeObserver(this, NotificationCenter.didSetOrRemoveTwoStepPassword);
         getNotificationCenter().removeObserver(this, NotificationCenter.didUpdateGlobalAutoDeleteTimer);
+        if (!getUserConfig().isSessionGenerationCurrent(sessionGeneration)) return;
         boolean save = false;
         if (currentSync != newSync) {
-            getUserConfig().syncContacts = newSync;
-            save = true;
-            if (newSync && ContactsController.hasContactsPermission()) {
+            boolean stored = getUserConfig().setContactSyncEnabled(newSync, sessionGeneration);
+            if (stored && newSync && ContactsController.hasContactsPermission()) {
                 getContactsController().forceImportContacts();
                 if (getParentActivity() != null) {
                     Toast.makeText(getParentActivity(), getString("SyncContactsAdded", R.string.SyncContactsAdded), Toast.LENGTH_SHORT).show();
@@ -334,7 +340,11 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
                 presentFragment(webSessionsActivityPreload);
             } else if (position == agramKeepDeletedRow) {
                 boolean enabled = !getMessagesController().isKeepDeletedMessagesEnabled();
-                getMessagesController().getMainSettings().edit().putBoolean(MessagesController.AGRAM_KEEP_DELETED_MESSAGES, enabled).apply();
+                if (!getMessagesController().setKeepDeletedMessagesEnabled(enabled, containerId, sessionGeneration)) {
+                    getNotificationCenter().postNotificationName(
+                            NotificationCenter.agramContainerPersistenceFailed, currentAccount, "deleted_messages");
+                    return;
+                }
                 if (view instanceof TextCheckCell) {
                     ((TextCheckCell) view).setChecked(enabled);
                 }
@@ -527,13 +537,17 @@ public class PrivacySettingsActivity extends BaseFragment implements Notificatio
                 builder.setMessage(AndroidUtilities.replaceTags(getString("SyncContactsDeleteText", R.string.SyncContactsDeleteText)));
                 builder.setNegativeButton(getString("Cancel", R.string.Cancel), null);
                 builder.setPositiveButton(getString("Delete", R.string.Delete), (dialogInterface, i) -> {
+                    if (!getUserConfig().isSessionGenerationCurrent(sessionGeneration)) return;
                     AlertDialog.Builder builder12 = new AlertDialog.Builder(getParentActivity(), 3, null);
                     progressDialog = builder12.show();
                     progressDialog.setCanCancel(false);
 
                     if (currentSync != newSync) {
-                        currentSync = getUserConfig().syncContacts = newSync;
-                        getUserConfig().saveConfig(false);
+                        if (!getUserConfig().setContactSyncEnabled(newSync, sessionGeneration)) {
+                            progressDialog.dismiss();
+                            return;
+                        }
+                        currentSync = newSync;
                     }
                     getContactsController().deleteAllContacts(() -> progressDialog.dismiss());
                 });

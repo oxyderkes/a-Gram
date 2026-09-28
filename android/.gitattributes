@@ -1,0 +1,2 @@
+# Preserve theme bytes on every platform, including embedded WPS wallpapers.
+*.attheme -text

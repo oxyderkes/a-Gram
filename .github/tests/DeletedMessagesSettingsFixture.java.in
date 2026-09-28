@@ -1,0 +1,256 @@
+package org.telegram.messenger;
+
+import android.content.SharedPreferences;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/** Runs the actual getter, setter and container fence with in-memory Android storage. */
+public final class DeletedMessagesSettingsFixture {
+    private static final UserConfig[] USERS = {new UserConfig(0), new UserConfig(1)};
+    private static final FakePreferences[] PREFS = {new FakePreferences(0), new FakePreferences(1)};
+
+    public static void main(String[] args) throws Exception {
+        AgramContainerManager manager = AgramContainerManager.getInstance();
+        manager.records.put(0, new ContainerRecord("container-a", 0));
+        manager.records.put(1, new ContainerRecord("container-b", 1));
+        MessagesController first = new MessagesController(0);
+        MessagesController second = new MessagesController(1);
+        check(first.isKeepDeletedMessagesEnabled(), "unset preference defaults on");
+        check(PREFS[0].live.isEmpty(), "reading the default does not overwrite preferences");
+        check(first.setKeepDeletedMessagesEnabled(false, "container-a", 0), "explicit disable persists");
+        first = new MessagesController(0);
+        check(!first.isKeepDeletedMessagesEnabled(), "explicit disable survives controller recreation");
+        check(Boolean.FALSE.equals(PREFS[0].disk.get("metadata_container-a")),
+                "disable reaches durable storage");
+        check(second.isKeepDeletedMessagesEnabled() && PREFS[1].live.isEmpty(), "other account is unchanged");
+        check(first.setKeepDeletedMessagesEnabled(true, "container-a", 0), "explicit enable persists");
+        PREFS[0].failNext = true;
+        check(!first.setKeepDeletedMessagesEnabled(false, "container-a", 0), "failed disable is reported");
+        check(first.isKeepDeletedMessagesEnabled(), "failed disable rolls runtime value back");
+        check(Boolean.TRUE.equals(PREFS[0].disk.get("metadata_container-a")),
+                "failed disable preserves durable value");
+        check(first.setKeepDeletedMessagesEnabled(false, "container-a", 0), "disable again");
+        PREFS[0].failNext = true;
+        check(!first.setKeepDeletedMessagesEnabled(true, "container-a", 0), "failed enable is reported");
+        check(!first.isKeepDeletedMessagesEnabled(), "failed enable preserves explicit disable");
+        int commits = PREFS[0].commits;
+        USERS[0].sessionLifecycle.advance();
+        check(!first.setKeepDeletedMessagesEnabled(true, "container-a", 0), "stale session is rejected");
+        check(!first.setKeepDeletedMessagesEnabled(true, "container-old", 1), "stale UUID is rejected");
+        check(!first.setKeepDeletedMessagesEnabled(true, null, 1), "missing UUID is rejected");
+        manager.records.get(0).accessible = false;
+        check(first.isKeepDeletedMessagesEnabled(), "locked metadata cannot trigger destructive false fallback");
+        check(!first.setKeepDeletedMessagesEnabled(true, "container-a", 1), "locked container is rejected");
+        manager.records.get(0).accessible = true;
+        manager.preferences.live.put("deletion_intent_container-a", true);
+        check(!first.setKeepDeletedMessagesEnabled(true, "container-a", 1), "retired container is rejected");
+        check(PREFS[0].commits == commits, "rejected owners perform no preference commits");
+        check(!first.isKeepDeletedMessagesEnabled(), "rejected owners preserve explicit disable");
+        manager.failRead = true;
+        check(first.isKeepDeletedMessagesEnabled(), "unavailable registry safely preserves ordinary rows");
+        manager.failRead = false;
+        PREFS[1].failNext = true;
+        check(!second.setKeepDeletedMessagesEnabled(false, "container-b", 0), "failed first choice is reported");
+        check(PREFS[1].live.isEmpty() && PREFS[1].disk.isEmpty(), "failed first choice restores unset state");
+        check(second.isKeepDeletedMessagesEnabled(), "unset fallback survives failed first choice");
+        manager.records.put(0, new ContainerRecord("replacement-container", 0));
+        check(first.isKeepDeletedMessagesEnabled(), "new container in reused slot does not inherit disabled preference");
+        check(!first.setKeepDeletedMessagesEnabled(false, "container-a", 1), "old UUID cannot change replacement");
+        PREFS[0].live.put(MessagesController.AGRAM_KEEP_DELETED_MESSAGES, false);
+        ContainerRecord migrated = new ContainerRecord("legacy-container", 0);
+        readPreference(new JSONObject(), migrated);
+        check(!migrated.keepDeletedMessages, "legacy explicit false survives migration");
+        JSONObject saved = new JSONObject();
+        writePreference(saved, migrated);
+        PREFS[0].live.put(MessagesController.AGRAM_KEEP_DELETED_MESSAGES, true);
+        readPreference(saved, migrated);
+        check(!migrated.keepDeletedMessages, "serialized container choice ignores legacy slot value");
+        ContainerRecord unset = new ContainerRecord("legacy-unset", 1);
+        readPreference(new JSONObject(), unset);
+        check(unset.keepDeletedMessages, "legacy unset preference migrates to enabled");
+        checkLogoutRace(second);
+        System.out.println("DeletedMessagesSettingsFixture: passed (default, persistence, rollback, account and session fences)");
+    }
+
+    private static void checkLogoutRace(MessagesController controller) throws Exception {
+        CountDownLatch enteredCommit = new CountDownLatch(1);
+        CountDownLatch releaseCommit = new CountDownLatch(1);
+        CountDownLatch logoutStarted = new CountDownLatch(1);
+        CountDownLatch logoutAdvanced = new CountDownLatch(1);
+        AtomicBoolean stored = new AtomicBoolean();
+        PREFS[1].beforeCommit = () -> {
+            enteredCommit.countDown();
+            try {
+                check(releaseCommit.await(5, TimeUnit.SECONDS), "release pending preference commit");
+            } catch (InterruptedException error) { throw new AssertionError(error); }
+        };
+        Thread writer = new Thread(() -> stored.set(
+                controller.setKeepDeletedMessagesEnabled(false, "container-b", 0)));
+        writer.start();
+        check(enteredCommit.await(5, TimeUnit.SECONDS), "writer reaches commit");
+        Thread logout = new Thread(() -> {
+            synchronized (USERS[1].sync) {
+                logoutStarted.countDown();
+                USERS[1].sessionLifecycle.advance();
+                logoutAdvanced.countDown();
+            }
+        });
+        logout.start();
+        check(logoutStarted.await(5, TimeUnit.SECONDS), "logout starts while storage is pending");
+        check(!logoutAdvanced.await(100, TimeUnit.MILLISECONDS), "generation cannot advance inside preference commit");
+        releaseCommit.countDown();
+        writer.join(5000);
+        logout.join(5000);
+        check(!writer.isAlive() && !logout.isAlive() && stored.get(), "commit and logout finish without deadlock");
+        PREFS[1].beforeCommit = null;
+        check(!controller.setKeepDeletedMessagesEnabled(true, "container-b", 0), "completed logout rejects stale writer");
+    }
+
+    private static void check(boolean value, String message) {
+        if (!value) throw new AssertionError(message);
+    }
+
+    private static final class MessagesController {
+        public static final String AGRAM_KEEP_DELETED_MESSAGES = "agram_keep_deleted_messages";
+        final int currentAccount;
+        final FakePreferences mainPreferences;
+        MessagesController(int account) { currentAccount = account; mainPreferences = PREFS[account]; }
+        UserConfig getUserConfig() { return USERS[currentAccount]; }
+        static SharedPreferences getMainSettings(int account) { return PREFS[account]; }
+        /* PRODUCTION_GETTER */
+        /* PRODUCTION_SETTER */
+    }
+
+    private static final class UserConfig {
+        final int currentAccount;
+        final Object sync = new Object();
+        final AgramSessionLifecycle sessionLifecycle = new AgramSessionLifecycle();
+        UserConfig(int account) { currentAccount = account; }
+        /* PRODUCTION_CONFIG_SETTER */
+    }
+
+    private static final class AgramContainerManager {
+        static final AgramContainerManager INSTANCE = new AgramContainerManager();
+        static final String DELETION_INTENT_PREFIX = "deletion_intent_";
+        final Object sync = new Object();
+        final Map<Integer, ContainerRecord> records = new HashMap<>();
+        final FakePreferences preferences = new FakePreferences(-1);
+        boolean failRead;
+        static AgramContainerManager getInstance() { return INSTANCE; }
+        ContainerRecord getContainer(int account) {
+            if (failRead) throw new IllegalStateException("simulated registry failure");
+            ContainerRecord source = records.get(account);
+            if (source == null) return null;
+            ContainerRecord copy = new ContainerRecord(source.id, source.account);
+            copy.accessible = source.accessible;
+            /* PRODUCTION_COPY */
+            return copy;
+        }
+        void saveRecord(ContainerRecord record) {
+            FakePreferences target = PREFS[record.account];
+            String key = "metadata_" + record.id;
+            if (!AgramPreferenceTransaction.commit(target, target.edit().putBoolean(key, record.keepDeletedMessages), key)) {
+                throw new IllegalStateException("simulated metadata persistence failure");
+            }
+            records.put(record.account, record);
+        }
+        /* PRODUCTION_CONTAINER_FENCE */
+        /* PRODUCTION_CONTAINER_GETTER */
+        /* PRODUCTION_CONTAINER_SETTER */
+    }
+
+    private static final class ContainerRecord {
+        final String id;
+        final int account;
+        boolean accessible = true;
+        boolean keepDeletedMessages;
+        ContainerRecord(String id, int account) {
+            this.id = id;
+            this.account = account;
+            /* PRODUCTION_DEFAULT */
+        }
+        boolean isStorageAccessible() { return accessible; }
+    }
+
+    private static final class JSONObject extends HashMap<String, Object> {
+        boolean has(String key) { return containsKey(key); }
+        boolean getBoolean(String key) { return (Boolean) get(key); }
+    }
+
+    private static final class Context {
+        static final int MODE_PRIVATE = 0;
+        FakePreferences getSharedPreferences(String name, int mode) {
+            return PREFS[name.equals("mainconfig") ? 0 : Integer.parseInt(name.substring(10))];
+        }
+    }
+
+    private static final class ApplicationLoader {
+        static final Context applicationContext = new Context();
+    }
+
+    private static void readPreference(JSONObject json, ContainerRecord record) {
+        /* PRODUCTION_READ */
+    }
+
+    private static void writePreference(JSONObject json, ContainerRecord record) {
+        /* PRODUCTION_WRITE */
+    }
+
+    private static final class ContainerIdentityException extends RuntimeException {
+        ContainerIdentityException(String message) { super(message); }
+    }
+
+    private static final class TextUtils {
+        static boolean equals(String first, String second) { return Objects.equals(first, second); }
+    }
+
+    private static final class FakePreferences implements SharedPreferences {
+        final int account;
+        final Map<String, Object> live = new HashMap<>();
+        final Map<String, Object> disk = new HashMap<>();
+        boolean failNext;
+        Runnable beforeCommit;
+        int commits;
+        FakePreferences(int account) { this.account = account; }
+        public Map<String, ?> getAll() { return new HashMap<>(live); }
+        boolean getBoolean(String key, boolean fallback) {
+            return live.containsKey(key) ? (Boolean) live.get(key) : fallback;
+        }
+        public Editor edit() {
+            return new Editor() {
+                final Map<String, Object> updates = new HashMap<>();
+                boolean clear;
+                private Editor put(String key, Object value) { updates.put(key, value); return this; }
+                public Editor putString(String k, String v) { return put(k, v); }
+                public Editor putBoolean(String k, boolean v) { return put(k, v); }
+                public Editor putInt(String k, int v) { return put(k, v); }
+                public Editor putLong(String k, long v) { return put(k, v); }
+                public Editor putFloat(String k, float v) { return put(k, v); }
+                public Editor putStringSet(String k, Set<String> v) { return put(k, v); }
+                public Editor remove(String k) { return put(k, null); }
+                public Editor clear() { clear = true; return this; }
+                public boolean commit() {
+                    check(Thread.holdsLock(AgramContainerManager.getInstance().sync), "UUID fence spans commit");
+                    check(Thread.holdsLock(USERS[account].sessionLifecycle), "session fence spans commit");
+                    check(!Thread.holdsLock(USERS[account].sync), "preference commit must not invert UserConfig lock order");
+                    if (beforeCommit != null) beforeCommit.run();
+                    commits++;
+                    if (clear) live.clear();
+                    for (Map.Entry<String, Object> entry : updates.entrySet()) {
+                        if (entry.getValue() == null) live.remove(entry.getKey());
+                        else live.put(entry.getKey(), entry.getValue());
+                    }
+                    boolean success = !failNext;
+                    failNext = false;
+                    if (success) { disk.clear(); disk.putAll(live); }
+                    return success;
+                }
+            };
+        }
+    }
+}

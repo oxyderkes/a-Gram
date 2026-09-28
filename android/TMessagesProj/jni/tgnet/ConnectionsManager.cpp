@@ -34,6 +34,7 @@
 #include "Config.h"
 #include "ProxyCheckInfo.h"
 #include "Handshake.h"
+#include "AgramNativeOwnerPolicy.h"
 
 #ifdef ANDROID
 #include <jni.h>
@@ -210,6 +211,10 @@ void ConnectionsManager::select() {
         connection->checkTimeout(now);
     }
 
+    if (containerOwnerPaused.load() || containerOwnerAwaitingResume) {
+        return;
+    }
+
     Datacenter *datacenter = getDatacenterWithId(currentDatacenterId);
     if (pushConnectionEnabled) {
         if ((sendingPushPing && llabs(now - lastPushPingTime) >= 30000) || llabs(now - lastPushPingTime) >= nextPingTimeOffset + 10000) {
@@ -300,9 +305,16 @@ void ConnectionsManager::select() {
     }
 }
 
-void ConnectionsManager::scheduleTask(std::function<void()> task) {
+void ConnectionsManager::scheduleTask(std::function<void()> task, std::function<void()> onRetired, bool ownerIndependent) {
+    const uint64_t epoch = containerOwnerEpoch.load();
     pthread_mutex_lock(&mutex);
-    pendingTasks.push(task);
+    pendingTasks.push([this, epoch, task, onRetired, ownerIndependent] {
+        if (!ownerIndependent && epoch != containerOwnerEpoch.load()) {
+            if (onRetired) onRetired();
+            return;
+        }
+        task();
+    });
     pthread_mutex_unlock(&mutex);
     wakeup();
 }
@@ -342,7 +354,10 @@ void *ConnectionsManager::ThreadProc(void *data) {
 #ifdef ANDROID
     javaVm->AttachCurrentThread(&jniEnv[networkManager->instanceNum], nullptr);
 #endif
-    if (networkManager->currentUserId != 0 && networkManager->pushConnectionEnabled) {
+    // Startup proxy/route tasks may have been queued before native_init. Apply
+    // them before even the first push ping can open a connection.
+    networkManager->checkPendingTasks();
+    if (!networkManager->containerOwnerPaused.load() && networkManager->currentUserId != 0 && networkManager->pushConnectionEnabled) {
         Datacenter *datacenter = networkManager->getDatacenterWithId(networkManager->currentDatacenterId);
         if (datacenter != nullptr) {
             datacenter->createPushConnection()->setSessionId(networkManager->pushSessionId);
@@ -360,6 +375,9 @@ void ConnectionsManager::loadConfig() {
         config = new Config(instanceNum, "tgnet.dat");
     }
     NativeByteBuffer *buffer = config->readConfig();
+    bool validOwnerExtension = true;
+    bool hasOwnerExtension = false;
+    std::string storedOwner;
     if (buffer != nullptr) {
         uint32_t version = buffer->readUint32(nullptr);
         if (LOGS_ENABLED) DEBUG_D("config version = %u", version);
@@ -404,16 +422,39 @@ void ConnectionsManager::loadConfig() {
                     }
                 }
             }
+            if (buffer->hasRemaining()) {
+                bool error = false;
+                const uint32_t tag = buffer->readUint32(&error);
+                const uint32_t extensionVersion = buffer->readUint32(&error);
+                storedOwner = buffer->readString(&error);
+                hasOwnerExtension = true;
+                validOwnerExtension = !error && !buffer->hasRemaining()
+                        && tag == AgramNativeOwnerPolicy::ExtensionTag
+                        && extensionVersion == AgramNativeOwnerPolicy::ExtensionVersion
+                        && (storedOwner.empty() || AgramNativeOwnerPolicy::validOwner(storedOwner));
+            }
+        } else {
+            validOwnerExtension = false;
         }
         buffer->reuse();
+    }
+
+    {
+        std::lock_guard<std::mutex> ownerLock(containerOwnerMutex);
+        containerOwnerId = storedOwner;
+    }
+    const auto ownerAction = AgramNativeOwnerPolicy::startup(expectedStartupOwnerId, storedOwner,
+            hasOwnerExtension, currentUserId != 0, validOwnerExtension && !config->hasReadFailure());
+    if (ownerAction == AgramNativeOwnerPolicy::StartupAction::Quarantine
+            || (startupRetirementPending && currentUserId != 0)) {
+        quarantineContainerTransport();
+        return;
     }
 
     if (currentUserId != 0) {
         Datacenter *datacenter = currentDatacenterId != 0 ? getDatacenterWithId(currentDatacenterId) : nullptr;
         if (currentDatacenterId == 0 || datacenter == nullptr || !datacenter->hasPermanentAuthKey()) {
-            localAuthConfigQuarantined = true;
-            networkAvailable = false;
-            connectionState = ConnectionStateWaitingForNetwork;
+            quarantineContainerTransport();
             if (LOGS_ENABLED) {
                 DEBUG_E("quarantine account%u: local config/auth key mismatch (dc=%u, present=%d, hasAuthKey=%d)",
                         instanceNum,
@@ -421,11 +462,6 @@ void ConnectionsManager::loadConfig() {
                         datacenter != nullptr,
                         datacenter != nullptr && datacenter->hasPermanentAuthKey());
             }
-            scheduleTask([&] {
-                if (delegate != nullptr) {
-                    delegate->onLogout(instanceNum, LogoutReasonLocalConfigMismatch);
-                }
-            });
             return;
         }
     }
@@ -439,12 +475,26 @@ void ConnectionsManager::loadConfig() {
         if (currentDatacenterId == 0) {
             currentDatacenterId = 2;
         }
-        saveConfig();
     }
     movingToDatacenterId = DEFAULT_DATACENTER_ID;
+    if (ownerAction == AgramNativeOwnerPolicy::StartupAction::RetireAndBind) {
+        // No network thread exists yet. Do not invalidate legitimate startup
+        // proxy/settings tasks queued before native_init; only retire disk keys.
+        retireContainerTransport();
+    }
+    if (ownerAction != AgramNativeOwnerPolicy::StartupAction::Keep
+            && !saveConfig(&expectedStartupOwnerId)) {
+        quarantineContainerTransport();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> ownerLock(containerOwnerMutex);
+        containerOwnerId = expectedStartupOwnerId;
+        containerOwnerPaused.store(startupRetirementPending);
+    }
 }
 
-void ConnectionsManager::saveConfigInternal(NativeByteBuffer *buffer) {
+void ConnectionsManager::saveConfigInternal(NativeByteBuffer *buffer, const std::string &ownerId) {
     buffer->writeInt32(configVersion);
     buffer->writeBool(testBackend);
     buffer->writeBool(clientBlocked);
@@ -473,22 +523,29 @@ void ConnectionsManager::saveConfigInternal(NativeByteBuffer *buffer) {
             datacenter.second->serializeToStream(buffer);
         }
     }
+    // v5 readers ignore this trailing extension; Agram treats missing ownership
+    // only as an explicit one-time migration, never as an already-bound owner.
+    buffer->writeInt32(AgramNativeOwnerPolicy::ExtensionTag);
+    buffer->writeInt32(AgramNativeOwnerPolicy::ExtensionVersion);
+    buffer->writeString(ownerId);
 }
 
-void ConnectionsManager::saveConfig() {
-    if (localAuthConfigQuarantined) {
+bool ConnectionsManager::saveConfig(const std::string *ownerTransition) {
+    if (localAuthConfigQuarantined || (containerOwnerPaused.load() && ownerTransition == nullptr)) {
         if (LOGS_ENABLED) DEBUG_E("skip config write for quarantined account%u", instanceNum);
-        return;
+        return false;
     }
     if (config == nullptr) {
         config = new Config(instanceNum, "tgnet.dat");
     }
+    const std::string ownerId = ownerTransition == nullptr ? getContainerOwner() : *ownerTransition;
     sizeCalculator->clearCapacity();
-    saveConfigInternal(sizeCalculator);
+    saveConfigInternal(sizeCalculator, ownerId);
     NativeByteBuffer *buffer = BuffersStorage::getInstance().getFreeBuffer(sizeCalculator->capacity());
-    saveConfigInternal(buffer);
-    config->writeConfig(buffer);
+    saveConfigInternal(buffer, ownerId);
+    const bool saved = config->writeConfig(buffer);
     buffer->reuse();
+    return saved;
 }
 
 inline NativeByteBuffer *decompressGZip(NativeByteBuffer *data) {
@@ -615,11 +672,149 @@ int64_t ConnectionsManager::generateMessageId() {
 }
 
 bool ConnectionsManager::isNetworkAvailable() {
-    return networkAvailable;
+    return networkAvailable && !containerOwnerPaused.load() && !containerOwnerAwaitingResume;
+}
+
+std::string ConnectionsManager::getContainerOwner() {
+    std::lock_guard<std::mutex> ownerLock(containerOwnerMutex);
+    return containerOwnerId;
+}
+
+bool ConnectionsManager::isContainerOwnerReady(const std::string &expectedOwnerId) {
+    std::lock_guard<std::mutex> ownerLock(containerOwnerMutex);
+    return AgramNativeOwnerPolicy::validOwner(expectedOwnerId)
+            && containerOwnerId == expectedOwnerId && !containerOwnerPaused.load();
+}
+
+void ConnectionsManager::quarantineContainerTransport() {
+    containerOwnerPaused.store(true);
+    localAuthConfigQuarantined = true;
+    networkAvailable = false;
+    connectionState = ConnectionStateWaitingForNetwork;
+    for (auto & entry : datacenters) {
+        entry.second->suspendConnections(true);
+        for (uint8_t index = 0; index < PROXY_CONNECTIONS_COUNT; ++index) {
+            Connection *connection = entry.second->getProxyConnection(index, false, false);
+            if (connection != nullptr) connection->suspendConnection();
+        }
+    }
+    // No destructive cleanup and no Java constructor callback. The synchronous
+    // init readiness query reports the failure without recursively constructing
+    // this slot's Java singleton or erasing a recoverable active identity.
+}
+
+void ConnectionsManager::retireContainerTransport() {
+    containerOwnerPaused.store(true);
+    containerOwnerAwaitingResume = true;
+    networkAvailable = false;
+    for (auto & entry : datacenters) {
+        Datacenter *datacenter = entry.second;
+        datacenter->suspendConnections(true);
+        for (uint8_t index = 0; index < PROXY_CONNECTIONS_COUNT; ++index) {
+            Connection *connection = datacenter->getProxyConnection(index, false, false);
+            if (connection != nullptr) connection->suspendConnection();
+        }
+        datacenter->clearAuthKey(HandshakeTypeAll); // also destroys handshake timers
+        datacenter->recreateSessions(HandshakeTypeAll);
+        datacenter->authorized = false;
+        datacenter->resetInitVersion();
+    }
+    // Do not exempt pre-login work: old sendCode/help/proxy requests must not
+    // enter the replacement owner. Request destructors perform Java onClear.
+    waitingLoginRequests.clear();
+    requestsQueue.clear();
+    runningRequests.clear();
+    proxyCheckQueue.clear();
+    proxyActiveChecks.clear();
+    quickAckIdToRequestIds.clear();
+    requestsByGuids.clear();
+    guidsByRequests.clear();
+    resendRequests.clear();
+    tokensToBeCancelled.clear();
+    requestingSaltsForDc.clear();
+    sessionsToDestroy.clear();
+    movingAuthorization.reset();
+    genericMessagesToDatacenters.clear();
+    genericMediaMessagesToDatacenters.clear();
+    tempMessagesToDatacenters.clear();
+    unknownDatacenterIds.clear();
+    neededDatacenters.clear();
+    unauthorizedDatacenters.clear();
+    downloadRunningRequestCount.clear();
+    downloadCancelRunningRequestCount.clear();
+    currentUserId = 0;
+    currentUserPremium = false;
+    registeredForInternalPush = false;
+    registeringForPush = false;
+    sendingPing = false;
+    sendingPushPing = false;
+    updatingDcSettings = false;
+    updatingDcSettingsAgain = false;
+    updatingDcSettingsWorkaround = false;
+    requestingSecondAddress = 0;
+    requestingSecondAddressByTlsHashMismatch = false;
+    disconnectTimeoutAmount = 0;
+    movingToDatacenterId = DEFAULT_DATACENTER_ID;
+    lastInvokeAfterMessageId = 0;
+    RAND_bytes(reinterpret_cast<uint8_t *>(&pushSessionId), sizeof(pushSessionId));
+    lastPushPingTime = 0;
+    for (auto & entry : datacenters) {
+        Connection *push = entry.second->getPushConnection(false);
+        if (push != nullptr) push->setSessionId(pushSessionId);
+    }
+}
+
+void ConnectionsManager::transitionContainerOwner(std::string expectedOwnerId, std::string newOwnerId,
+                                                 std::function<void(bool)> completion) {
+    bool accepted = false;
+    bool alreadyReady = false;
+    {
+        std::lock_guard<std::mutex> ownerLock(containerOwnerMutex);
+        alreadyReady = !containerOwnerPaused.load() && containerOwnerId == expectedOwnerId
+                && expectedOwnerId == newOwnerId && AgramNativeOwnerPolicy::validOwner(newOwnerId);
+        if (!alreadyReady && !containerOwnerTransitionPending && containerOwnerId == expectedOwnerId
+                && (newOwnerId.empty() || AgramNativeOwnerPolicy::validOwner(newOwnerId))) {
+            containerOwnerTransitionPending = true;
+            containerOwnerPaused.store(true);
+            // Fence deferred native lambdas immediately, not when their queue
+            // eventually reaches the destructive retirement operation.
+            containerOwnerEpoch.fetch_add(1);
+            accepted = true;
+        }
+    }
+    if (!accepted) {
+        scheduleTask([completion, alreadyReady] { if (completion) completion(alreadyReady); }, nullptr, true);
+        return;
+    }
+    scheduleTask([this, expectedOwnerId, newOwnerId, completion] {
+        bool success = false;
+        const bool explicitLogout = !expectedOwnerId.empty() && newOwnerId.empty();
+        // A mismatched active session is recoverable state, never something an
+        // attempted new login is allowed to clear. Only exact-owner logout is
+        // destructive while a native user remains authorized.
+        if (getContainerOwner() == expectedOwnerId && (currentUserId == 0 || explicitLogout)
+                && (!localAuthConfigQuarantined || explicitLogout)) {
+            retireContainerTransport();
+            localAuthConfigQuarantined = false;
+            success = saveConfig(&newOwnerId);
+        }
+        {
+            std::lock_guard<std::mutex> ownerLock(containerOwnerMutex);
+            if (success) {
+                containerOwnerId = newOwnerId;
+                containerOwnerPaused.store(newOwnerId.empty());
+            }
+            containerOwnerTransitionPending = false;
+        }
+        // Failure remains paused with the old owner identity. No callback is
+        // invoked while either the owner mutex or native task mutex is held.
+        if (completion) completion(success);
+    }, nullptr, true);
 }
 
 void ConnectionsManager::cleanUp(bool resetKeys, int32_t datacenterId) {
     scheduleTask([&, resetKeys, datacenterId] {
+        if (containerOwnerPaused.load()) return;
         for (auto iter = requestsQueue.begin(); iter != requestsQueue.end();) {
             Request *request = iter->get();
             if (datacenterId != -1) {
@@ -691,6 +886,7 @@ void ConnectionsManager::cleanUp(bool resetKeys, int32_t datacenterId) {
 }
 
 void ConnectionsManager::onConnectionClosed(Connection *connection, int reason) {
+    if (containerOwnerPaused.load()) return;
     if (reason == 1) {
         lastProtocolUsefullData = false;
     }
@@ -793,6 +989,10 @@ void ConnectionsManager::onConnectionClosed(Connection *connection, int reason) 
 }
 
 void ConnectionsManager::onConnectionConnected(Connection *connection) {
+    if (containerOwnerPaused.load()) {
+        connection->suspendConnection();
+        return;
+    }
     Datacenter *datacenter = connection->getDatacenter();
     ConnectionType connectionType = connection->getConnectionType();
     if ((connectionType == ConnectionTypeGeneric || connectionType == ConnectionTypeGenericMedia) && datacenter->isHandshakingAny()) {
@@ -832,6 +1032,7 @@ void ConnectionsManager::onConnectionQuickAckReceived(Connection *connection, in
 }
 
 void ConnectionsManager::onConnectionDataReceived(Connection *connection, NativeByteBuffer *data, uint32_t length) {
+    if (containerOwnerPaused.load()) return;
     bool error = false;
     if (length <= 24 + 32) {
         int32_t code = data->readInt32(&error);
@@ -1770,6 +1971,7 @@ void ConnectionsManager::processServerResponse(TLObject *message, int64_t messag
 }
 
 void ConnectionsManager::sendPing(Datacenter *datacenter, bool usePushConnection) {
+    if (containerOwnerPaused.load()) return;
     if (usePushConnection && (currentUserId == 0 || !usePushConnection)) {
         return;
     }
@@ -1893,6 +2095,12 @@ void ConnectionsManager::detachConnection(ConnectionSocket *connection) {
 }
 
 int32_t ConnectionsManager::sendRequestInternal(TLObject *object, onCompleteFunc onComplete, onQuickAckFunc onQuickAck, onRequestClearFunc onClear, uint32_t flags, uint32_t datacenterId, ConnectionType connectionType, bool immediate) {
+    if (containerOwnerPaused.load()) {
+        const int32_t token = lastRequestToken++;
+        delete object;
+        if (onClear) onClear();
+        return token;
+    }
     auto request = new Request(instanceNum, lastRequestToken++, connectionType, flags, datacenterId, onComplete, onQuickAck, nullptr, onClear);
     request->rawRequest = object;
     request->rpcRequest = wrapInLayer(object, getDatacenterWithId(datacenterId), request);
@@ -1900,8 +2108,9 @@ int32_t ConnectionsManager::sendRequestInternal(TLObject *object, onCompleteFunc
     if (cancelledIterator != tokensToBeCancelled.end()) {
         if (LOGS_ENABLED) DEBUG_D("(3) request is cancelled before sending, token %d", request->requestToken);
         tokensToBeCancelled.erase(cancelledIterator);
+        const int32_t token = request->requestToken;
         delete request;
-        return request->requestToken;
+        return token;
     }
     if (!currentUserId && !(flags & RequestFlagWithoutLogin)) {
         if (LOGS_ENABLED) DEBUG_D("can't do request without login %s, reschedule token %d", typeid(*object).name(), request->requestToken);
@@ -1925,6 +2134,11 @@ int32_t ConnectionsManager::sendRequest(TLObject *object, onCompleteFunc onCompl
         requestToken = lastRequestToken++;
     }
     scheduleTask([&, requestToken, object, onComplete, onQuickAck, onClear, flags, datacenterId, connectionType, immediate] {
+        if (containerOwnerPaused.load()) {
+            delete object;
+            if (onClear) onClear();
+            return;
+        }
         auto request = new Request(instanceNum, requestToken, connectionType, flags, datacenterId, onComplete, onQuickAck, nullptr, onClear);
         request->rawRequest = object;
         request->rpcRequest = wrapInLayer(object, getDatacenterWithId(datacenterId), request);
@@ -1933,6 +2147,7 @@ int32_t ConnectionsManager::sendRequest(TLObject *object, onCompleteFunc onCompl
             if (LOGS_ENABLED) DEBUG_D("(1) request is cancelled before sending, token %d", requestToken);
             tokensToBeCancelled.erase(cancelledIterator);
             delete request;
+            return;
         }
         if (!currentUserId && !(flags & RequestFlagWithoutLogin)) {
             if (LOGS_ENABLED) DEBUG_D("can't do request without login %s, reschedule token %d", typeid(*object).name(), requestToken);
@@ -1943,6 +2158,9 @@ int32_t ConnectionsManager::sendRequest(TLObject *object, onCompleteFunc onCompl
                 processRequestQueue(0, 0);
             }
         }
+    }, [object, onClear] {
+        delete object;
+        if (onClear) onClear();
     });
     return requestToken;
 }
@@ -1950,6 +2168,11 @@ int32_t ConnectionsManager::sendRequest(TLObject *object, onCompleteFunc onCompl
 #ifdef ANDROID
 void ConnectionsManager::sendRequest(TLObject *object, onCompleteFunc onComplete, onQuickAckFunc onQuickAck, onWriteToSocketFunc onWriteToSocket, onRequestClearFunc onClear, uint32_t flags, uint32_t datacenterId, ConnectionType connectionType, bool immediate, int32_t requestToken) {
     scheduleTask([&, requestToken, object, onComplete, onQuickAck, onWriteToSocket, onClear, flags, datacenterId, connectionType, immediate] {
+        if (containerOwnerPaused.load()) {
+            delete object;
+            if (onClear) onClear();
+            return;
+        }
         if (LOGS_ENABLED) DEBUG_D("send request %p - %s", object, typeid(*object).name());
         auto request = new Request(instanceNum, requestToken, connectionType, flags, datacenterId, onComplete, onQuickAck, onWriteToSocket, onClear);
         request->rawRequest = object;
@@ -1971,6 +2194,9 @@ void ConnectionsManager::sendRequest(TLObject *object, onCompleteFunc onComplete
                 processRequestQueue(0, 0);
             }
         }
+    }, [object, onClear] {
+        delete object;
+        if (onClear) onClear();
     });
 }
 #endif
@@ -2015,6 +2241,7 @@ void ConnectionsManager::setUserPremium(bool premium) {
 
 void ConnectionsManager::setUserId(int64_t userId) {
     scheduleTask([&, userId] {
+        if (containerOwnerPaused.load()) return;
         int32_t oldUserId = currentUserId;
         currentUserId = userId;
         if (oldUserId == userId && userId != 0) {
@@ -2191,7 +2418,7 @@ void ConnectionsManager::failNotRunningRequest(int32_t token) {
         return;
     }
 
-    scheduleTask([&, token] {
+    scheduleTask([&, token]() -> void {
         for (auto iter = requestsQueue.begin(); iter != requestsQueue.end(); iter++) {
             Request *request = iter->get();
             if ((token != 0 && request->requestToken == token)) {
@@ -2205,7 +2432,7 @@ void ConnectionsManager::failNotRunningRequest(int32_t token) {
                 if (LOGS_ENABLED) DEBUG_D("cancelled queued rpc request %p - %s", request->rawRequest, typeid(*request->rawRequest).name());
                 requestsQueue.erase(iter);
                 removeRequestFromGuid(token);
-                return true;
+                return;
             }
         }
     });
@@ -2266,11 +2493,21 @@ void ConnectionsManager::receivedCaptchaResult(int32_t requestTokensCount, int32
         }
 
         delete[] requestTokens;
-    });
+    }, [requestTokens] { delete[] requestTokens; });
 }
 
 void ConnectionsManager::onDatacenterHandshakeComplete(Datacenter *datacenter, HandshakeType type, int32_t timeDiff) {
-    saveConfig();
+    if (containerOwnerPaused.load()) return;
+    if (!saveConfig()) {
+        // Never authorize traffic with a new key that exists only in RAM. Keep
+        // both in-memory and last durable keys for recovery; this is a typed
+        // local-storage fault, not evidence of remote logout/revocation.
+        quarantineContainerTransport();
+        if (delegate != nullptr) {
+            delegate->onLogout(instanceNum, LogoutReasonLocalConfigMismatch);
+        }
+        return;
+    }
     uint32_t datacenterId = datacenter->getDatacenterId();
     if (datacenterId == currentDatacenterId || datacenterId == movingToDatacenterId || updatingDcSettingsWorkaround || updatingDcSettings) {
         timeDifference = timeDiff;
@@ -2293,7 +2530,7 @@ void ConnectionsManager::onDatacenterExportAuthorizationComplete(Datacenter *dat
 }
 
 void ConnectionsManager::sendMessagesToConnection(std::vector<std::unique_ptr<NetworkMessage>> &messages, Connection *connection, bool reportAck) {
-    if (messages.empty() || connection == nullptr) {
+    if (containerOwnerPaused.load() || messages.empty() || connection == nullptr) {
         return;
     }
 
@@ -2442,6 +2679,7 @@ inline void addMessageToDatacenter(uint32_t datacenterId, NetworkMessage *networ
 #define MAX_UPLOAD_REQUESTS 10 * 3
 
 void ConnectionsManager::processRequestQueue(uint32_t connectionTypes, uint32_t dc) {
+    if (containerOwnerPaused.load()) return;
     genericMessagesToDatacenters.clear();
     genericMediaMessagesToDatacenters.clear();
     tempMessagesToDatacenters.clear();
@@ -3156,15 +3394,8 @@ std::unique_ptr<TLObject> ConnectionsManager::wrapInLayer(TLObject *object, Data
             auto jsonObject = new TL_jsonObject();
             request->params = std::unique_ptr<JSONValue>(jsonObject);
 
-            if (!currentRegId.empty()) {
-                auto objectValue = new TL_jsonObjectValue();
-                jsonObject->value.push_back(std::unique_ptr<TL_jsonObjectValue>(objectValue));
-
-                auto jsonString = new TL_jsonString();
-                jsonString->value = currentRegId;
-                objectValue->key = "device_token";
-                objectValue->value = std::unique_ptr<JSONValue>(jsonString);
-            }
+            // Agram never emits a shared device_token, even if a stale Java/JNI
+            // caller supplies one. Container Simple Push uses registerDevice.
             if (!certFingerprint.empty()) {
                 auto objectValue = new TL_jsonObjectValue();
                 jsonObject->value.push_back(std::unique_ptr<TL_jsonObjectValue>(objectValue));
@@ -3327,6 +3558,7 @@ inline std::string decodeSecret(std::string secret) {
 }
 
 void ConnectionsManager::updateDcSettings(uint32_t dcNum, bool workaround, bool ifLoadingTryAgain) {
+    if (containerOwnerPaused.load()) return;
     if (workaround) {
         if (updatingDcSettingsWorkaround) {
             return;
@@ -3580,6 +3812,10 @@ inline bool checkPhoneByPrefixesRules(std::string phone, std::string rules) {
 
 void ConnectionsManager::applyDnsConfig(NativeByteBuffer *buffer, std::string phone, int32_t date) {
     scheduleTask([&, buffer, phone, date] {
+        if (containerOwnerPaused.load()) {
+            buffer->reuse();
+            return;
+        }
         int32_t realDate = date;
         if (LOGS_ENABLED) DEBUG_D("trying to decrypt config %d", requestingSecondAddress);
         TL_help_configSimple *config = Datacenter::decodeSimpleConfig(buffer);
@@ -3647,10 +3883,12 @@ void ConnectionsManager::applyDnsConfig(NativeByteBuffer *buffer, std::string ph
             }
         }
         buffer->reuse();
-    });
+    }, [buffer] { buffer->reuse(); });
 }
 
-void ConnectionsManager::init(uint32_t version, int32_t layer, int32_t apiId, std::string deviceModel, std::string systemVersion, std::string appVersion, std::string langCode, std::string systemLangCode, std::string configPath, std::string logPath, std::string regId, std::string cFingerpting, std::string installerId, std::string packageId, int32_t timezoneOffset, int64_t userId, bool userPremium, bool isPaused, bool enablePushConnection, bool hasNetwork, int32_t networkType, int32_t performanceClass) {
+void ConnectionsManager::init(uint32_t version, int32_t layer, int32_t apiId, std::string deviceModel, std::string systemVersion, std::string appVersion, std::string langCode, std::string systemLangCode, std::string configPath, std::string logPath, std::string regId, std::string cFingerpting, std::string installerId, std::string packageId, int32_t timezoneOffset, int64_t userId, bool userPremium, bool isPaused, bool enablePushConnection, bool hasNetwork, int32_t networkType, int32_t performanceClass, std::string ownerId, bool retirementPending) {
+    expectedStartupOwnerId = ownerId;
+    startupRetirementPending = retirementPending;
     currentVersion = version;
     currentLayer = layer;
     currentApiId = apiId;
@@ -3659,7 +3897,7 @@ void ConnectionsManager::init(uint32_t version, int32_t layer, int32_t apiId, st
     currentSystemVersion = systemVersion;
     currentAppVersion = appVersion;
     currentLangCode = langCode;
-    currentRegId = regId;
+    currentRegId.clear();
     certFingerprint = cFingerpting;
     installer = installerId;
     package = packageId;
@@ -3764,17 +4002,8 @@ void ConnectionsManager::setLangCode(std::string langCode) {
 }
 
 void ConnectionsManager::setRegId(std::string regId) {
-    scheduleTask([&, regId] {
-        if (currentRegId == regId) {
-            return;
-        }
-        currentRegId = regId;
-        for (auto & datacenter : datacenters) {
-            datacenter.second->resetInitVersion();
-        }
-        updateDcSettings(0, false, true);
-        saveConfig();
-    });
+    // Legacy registration is disabled for every Agram container and push mode.
+    // Do not wake account connections or update DC settings on token callbacks.
 }
 
 void ConnectionsManager::setSystemLangCode(std::string langCode) {
@@ -3817,10 +4046,13 @@ void ConnectionsManager::setSessionProfile(std::string deviceModel, std::string 
 
 void ConnectionsManager::resumeNetwork(bool partial) {
     scheduleTask([&, partial] {
-        if (localAuthConfigQuarantined) {
+        if (containerOwnerPaused.load() || localAuthConfigQuarantined) {
             if (LOGS_ENABLED) DEBUG_E("ignore network resume for quarantined account%u", instanceNum);
             return;
         }
+        // Java enqueues the new owner's profile and route before this owned
+        // resume. Durable UUID binding alone never starts a stale-route socket.
+        containerOwnerAwaitingResume = false;
         if (lastMonotonicPauseTime != 0) {
             int64_t diff = (getCurrentTimeMonotonicMillis() - lastMonotonicPauseTime) / 1000;
             int64_t systemDiff = getCurrentTime() - lastSystemPauseTime;
@@ -3870,7 +4102,7 @@ void ConnectionsManager::pauseNetwork() {
 
 void ConnectionsManager::setNetworkAvailable(bool value, int32_t type, bool slow) {
     scheduleTask([&, value, type, slow] {
-        if (localAuthConfigQuarantined) {
+        if (containerOwnerPaused.load() || localAuthConfigQuarantined) {
             networkAvailable = false;
             connectionState = ConnectionStateWaitingForNetwork;
             if (delegate != nullptr) {
@@ -3883,6 +4115,10 @@ void ConnectionsManager::setNetworkAvailable(bool value, int32_t type, bool slow
         networkAvailable = value;
         currentNetworkType = type;
         networkSlow = slow;
+        if (containerOwnerAwaitingResume) {
+            connectionState = ConnectionStateWaitingForNetwork;
+            return;
+        }
         if (!networkAvailable) {
             connectionState = ConnectionStateWaitingForNetwork;
         } else {
@@ -3940,18 +4176,26 @@ int64_t ConnectionsManager::checkProxy(std::string address, uint16_t port, std::
     proxyCheckInfo->instanceNum = instanceNum;
     proxyCheckInfo->ptr1 = ptr1;
 
+    const int64_t pingId = proxyCheckInfo->pingId;
     scheduleCheckProxyInternal(proxyCheckInfo);
-
-    return proxyCheckInfo->pingId;
+    return pingId;
 }
 
 void ConnectionsManager::scheduleCheckProxyInternal(ProxyCheckInfo *proxyCheckInfo) {
     scheduleTask([&, proxyCheckInfo] {
         checkProxyInternal(proxyCheckInfo);
+    }, [proxyCheckInfo] {
+        if (proxyCheckInfo->onRequestTime) proxyCheckInfo->onRequestTime(-1);
+        delete proxyCheckInfo;
     });
 }
 
 void ConnectionsManager::checkProxyInternal(ProxyCheckInfo *proxyCheckInfo) {
+    if (containerOwnerPaused.load()) {
+        if (proxyCheckInfo->onRequestTime) proxyCheckInfo->onRequestTime(-1);
+        delete proxyCheckInfo;
+        return;
+    }
     int32_t freeConnectionNum = -1;
     if (proxyActiveChecks.size() != PROXY_CONNECTIONS_COUNT) {
         for (int32_t a = 0; a < PROXY_CONNECTIONS_COUNT; a++) {

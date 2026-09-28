@@ -125,6 +125,7 @@ import android.window.OnBackInvokedDispatcher;
 import androidx.annotation.Keep;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.annotation.OptIn;
 import androidx.annotation.RequiresApi;
 import androidx.collection.LongSparseArray;
 import androidx.core.content.ContextCompat;
@@ -138,18 +139,18 @@ import androidx.dynamicanimation.animation.DynamicAnimation;
 import androidx.dynamicanimation.animation.FloatValueHolder;
 import androidx.dynamicanimation.animation.SpringAnimation;
 import androidx.dynamicanimation.animation.SpringForce;
+import androidx.media3.common.util.UnstableApi;
 import androidx.recyclerview.widget.DefaultItemAnimator;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import org.telegram.ui.recyclerview.LinearSmoothScrollerEnd;
 import androidx.recyclerview.widget.RecyclerView;
 
-import com.google.android.exoplayer2.C;
-import com.google.android.exoplayer2.ExoPlayer;
-import com.google.android.exoplayer2.Format;
-import com.google.android.exoplayer2.analytics.AnalyticsListener;
-import com.google.android.exoplayer2.ui.AspectRatioFrameLayout;
-import com.google.android.exoplayer2.video.VideoFrameMetadataListener;
-import com.google.android.exoplayer2.video.VideoSize;
+import androidx.media3.common.C;
+import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.common.Format;
+import androidx.media3.exoplayer.analytics.AnalyticsListener;
+import androidx.media3.exoplayer.video.VideoFrameMetadataListener;
+import androidx.media3.common.VideoSize;
 import com.google.android.gms.cast.framework.CastContext;
 import com.google.android.gms.vision.Frame;
 import com.google.android.gms.vision.face.Face;
@@ -4640,7 +4641,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                 f = pageBlocksAdapter.getFile(currentIndex);
             }
             if (f != null && !f.exists()) {
-                f = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE), f.getName());
+                f = new File(FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_CACHE), f.getName());
             }
 
             if (f != null && f.exists()) {
@@ -4933,7 +4934,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                                 f = FileLoader.getInstance(currentMessageObject.currentAccount)
                                         .getPathToAttachForMessage(currentMessageObject, fileLocation, true, true);
                                 if (!f.exists()) {
-                                    f = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE), f.getName());
+                                    f = new File(FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_CACHE), f.getName());
                                 }
                             } else {
                                 f = FileLoader.getInstance(currentMessageObject.currentAccount).getPathToMessage(currentMessageObject.messageOwner);
@@ -4956,7 +4957,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                             isVideo = false;
                         }
                         if (f != null && !f.exists()) {
-                            f = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE), f.getName());
+                            f = new File(FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_CACHE), f.getName());
                         }
 
                         final boolean isLivePhoto = currentMessageObject != null && currentMessageObject.isLivePhoto();
@@ -5762,7 +5763,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                     return true;
                 } else if (currentFileLocationVideo != null) {
                     File f = FileLoader.getInstance(currentAccount).getPathToAttach(getFileLocation(currentFileLocationVideo), getFileLocationExt(currentFileLocationVideo), avatarsDialogId != 0 || isEvent);
-                    File f2 = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE), f.getName());
+                    File f2 = new File(FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_CACHE), f.getName());
                     File f3 = FileLoader.getInstance(currentAccount).getPathToAttach(getFileLocation(currentFileLocationVideo), getFileLocationExt(currentFileLocationVideo), false);
                     return f.exists() || f2.exists() || f3.exists();
                 } else if (pageBlocksAdapter != null) {
@@ -6508,7 +6509,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
             }
             final MediaController.PhotoEntry entry = (MediaController.PhotoEntry) imagesArrLocals.get(currentIndex);
             final long time = coverEditor.getTime();
-            final String coverPath = getTempFileAbsolutePath();
+            final String coverPath = getTempFileAbsolutePath(currentAccount);
             coverEditor.button.setLoading(true);
             Utilities.globalQueue.postRunnable(() -> {
 
@@ -6588,7 +6589,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
             coverEditor.closeGallery();
             coverEditor.button.setLoading(true);
             final MediaController.PhotoEntry entry = (MediaController.PhotoEntry) imagesArrLocals.get(currentIndex);
-            final String coverPath = getTempFileAbsolutePath();
+            final String coverPath = getTempFileAbsolutePath(currentAccount);
             Utilities.globalQueue.postRunnable(() -> {
                 Bitmap frame = BitmapFactory.decodeFile(fromEntry.path);
                 if (frame == null) {
@@ -8226,7 +8227,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                             videoEditedInfo1.isSticker = true;
                             videoEditedInfo1.estimatedSize = 256 * 1024;
                         }
-                        TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(canvasBitmap, Bitmap.CompressFormat.WEBP, stickerMaxSize, stickerMaxSize, 100, false, 101, 101);
+                        TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(currentAccount, canvasBitmap, Bitmap.CompressFormat.WEBP, stickerMaxSize, stickerMaxSize, 100, false, 101, 101);
                         final String fullStickerPath = FileLoader.getInstance(UserConfig.selectedAccount).getPathToAttach(size, "webp", true).toString();
                         if (videoEditedInfo1 != null) {
                             videoEditedInfo1.originalPath = fullStickerPath;
@@ -8301,7 +8302,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                                     viewer.paintingOverlay.draw(canvas);
                                     canvas.restore();
                                 }
-                                TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(bitmap, getCompressFormat(), thumbSize, thumbSize, 83, false, 101, 101);
+                                TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(currentAccount, bitmap, getCompressFormat(), thumbSize, thumbSize, 83, false, 101, 101);
                                 photoEntry.thumbPath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
                             }
 
@@ -8370,8 +8371,8 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         }
     }
 
-    public static String getTempFileAbsolutePath() {
-        File file = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE), SharedConfig.getLastLocalId() + "_temp.jpg");
+    public static String getTempFileAbsolutePath(int account) {
+        File file = new File(FileLoader.getDirectory(account, FileLoader.MEDIA_DIR_CACHE), SharedConfig.getLastLocalId() + "_temp.jpg");
         return file.getAbsolutePath();
     }
 
@@ -11331,31 +11332,31 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                     Bitmap paintBitmap = BitmapFactory.decodeFile(entry.fullPaintPath);
                     Bitmap croppedPaintBitmap = createCroppedBitmap(paintBitmap, entry.cropState, null, false);
                     if (hasAnimatedMediaEntities()) {
-                        TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(croppedBitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
+                        TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(currentAccount, croppedBitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
                         entry.imagePath = currentImagePath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
                     } else {
-                        mergeImages(entry.imagePath = getTempFileAbsolutePath(), null, croppedPaintBitmap, croppedBitmap, AndroidUtilities.getPhotoSize(), true);
+                        mergeImages(entry.imagePath = getTempFileAbsolutePath(currentAccount), null, croppedPaintBitmap, croppedBitmap, AndroidUtilities.getPhotoSize(), true);
                     }
-                    mergeImages(entry.thumbPath = getTempFileAbsolutePath(), null, croppedPaintBitmap, croppedBitmap, thumbSize, true);
+                    mergeImages(entry.thumbPath = getTempFileAbsolutePath(currentAccount), null, croppedPaintBitmap, croppedBitmap, thumbSize, true);
                 } else {
-                    TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(croppedBitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
+                    TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(currentAccount, croppedBitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
                     entry.imagePath = currentImagePath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
-                    size = ImageLoader.scaleAndSaveImage(croppedBitmap, thumbSize, thumbSize, 70, false, 101, 101);
+                    size = ImageLoader.scaleAndSaveImage(currentAccount, croppedBitmap, thumbSize, thumbSize, 70, false, 101, 101);
                     entry.thumbPath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
                 }
             } else if (entry.paintPath != null) {
                 Bitmap paintBitmap = BitmapFactory.decodeFile(entry.fullPaintPath);
                 if (hasAnimatedMediaEntities()) {
-                    TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(croppedBitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
+                    TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(currentAccount, croppedBitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
                     entry.imagePath = currentImagePath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
                 } else {
-                    mergeImages(entry.imagePath = getTempFileAbsolutePath(), null, croppedBitmap, paintBitmap, AndroidUtilities.getPhotoSize(), false);
+                    mergeImages(entry.imagePath = getTempFileAbsolutePath(currentAccount), null, croppedBitmap, paintBitmap, AndroidUtilities.getPhotoSize(), false);
                 }
-                mergeImages(entry.thumbPath = getTempFileAbsolutePath(), null, croppedBitmap, paintBitmap, thumbSize, false);
+                mergeImages(entry.thumbPath = getTempFileAbsolutePath(currentAccount), null, croppedBitmap, paintBitmap, thumbSize, false);
             } else {
-                TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(croppedBitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
+                TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(currentAccount, croppedBitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
                 entry.imagePath = currentImagePath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
-                size = ImageLoader.scaleAndSaveImage(croppedBitmap, thumbSize, thumbSize, 70, false, 101, 101);
+                size = ImageLoader.scaleAndSaveImage(currentAccount, croppedBitmap, thumbSize, thumbSize, 70, false, 101, 101);
                 entry.thumbPath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
             }
         }
@@ -11470,13 +11471,13 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
 
                     if (!isCurrentVideo || entry.isLivePhoto()) {
                         if (hasAnimatedMediaEntities()) {
-                            TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(croppedBitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
+                            TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(currentAccount, croppedBitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
                             entry.imagePath = currentImagePath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
                         } else {
-                            mergeImages(entry.imagePath = getTempFileAbsolutePath(), null, croppedPaintBitmap, croppedBitmap, AndroidUtilities.getPhotoSize(), true);
+                            mergeImages(entry.imagePath = getTempFileAbsolutePath(currentAccount), null, croppedPaintBitmap, croppedBitmap, AndroidUtilities.getPhotoSize(), true);
                         }
                     }
-                    mergeImages(entry.thumbPath = getTempFileAbsolutePath(), null, croppedPaintBitmap, croppedBitmap, thumbSize, true);
+                    mergeImages(entry.thumbPath = getTempFileAbsolutePath(currentAccount), null, croppedPaintBitmap, croppedBitmap, thumbSize, true);
                     if (croppedPaintBitmap != null) {
                         croppedPaintBitmap.recycle();
                     }
@@ -11485,10 +11486,10 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                     }
                 } else {
                     if (!isCurrentVideo || entry.isLivePhoto()) {
-                        TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(croppedBitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
+                        TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(currentAccount, croppedBitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
                         entry.imagePath = currentImagePath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
                     }
-                    TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(croppedBitmap, thumbSize, thumbSize, 70, false, 101, 101);
+                    TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(currentAccount, croppedBitmap, thumbSize, thumbSize, 70, false, 101, 101);
                     entry.thumbPath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
                 }
                 if (currentEditMode == EDIT_MODE_NONE && isCurrentVideo) {
@@ -11500,15 +11501,15 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
             if (entry.filterPath != null) {
                 new File(entry.filterPath).delete();
             }
-            TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(bitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(true), AndroidUtilities.getPhotoSize(true), 87, false, 101, 101);
+            TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(currentAccount, bitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(true), AndroidUtilities.getPhotoSize(true), 87, false, 101, 101);
             entry.filterPath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
             Bitmap b = entry.cropState != null ? createCroppedBitmap(bitmap, entry.cropState, null, true) : bitmap;
             if (entry.paintPath == null) {
                 if (!isCurrentVideo || entry.isLivePhoto()) {
-                    size = ImageLoader.scaleAndSaveImage(b, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
+                    size = ImageLoader.scaleAndSaveImage(currentAccount, b, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
                     entry.imagePath = currentImagePath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
                 }
-                size = ImageLoader.scaleAndSaveImage(b, getCompressFormat(), thumbSize, thumbSize, 83, false, 101, 101);
+                size = ImageLoader.scaleAndSaveImage(currentAccount, b, getCompressFormat(), thumbSize, thumbSize, 83, false, 101, 101);
                 entry.thumbPath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
             } else {
                 String path = entry.fullPaintPath;
@@ -11530,13 +11531,13 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                 }
                 if (!isCurrentVideo || entry.isLivePhoto()) {
                     if (hasAnimatedMediaEntities()) {
-                        size = ImageLoader.scaleAndSaveImage(b, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
+                        size = ImageLoader.scaleAndSaveImage(currentAccount, b, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
                         entry.imagePath = currentImagePath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
                     } else {
-                        mergeImages(entry.imagePath = getTempFileAbsolutePath(), path, paintBitmap, b, AndroidUtilities.getPhotoSize(), true);
+                        mergeImages(entry.imagePath = getTempFileAbsolutePath(currentAccount), path, paintBitmap, b, AndroidUtilities.getPhotoSize(), true);
                     }
                 }
-                mergeImages(entry.thumbPath = getTempFileAbsolutePath(), path, paintBitmap, b, thumbSize, true);
+                mergeImages(entry.thumbPath = getTempFileAbsolutePath(currentAccount), path, paintBitmap, b, thumbSize, true);
                 if (recyclePaint) {
                     paintBitmap.recycle();
                 }
@@ -11551,14 +11552,14 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                     new File(entry.fullPaintPath).delete();
                 }
             }
-            TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(bitmap, Bitmap.CompressFormat.PNG, AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
+            TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(currentAccount, bitmap, Bitmap.CompressFormat.PNG, AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
 
             entry.stickers = stickers != null ? new ArrayList<>(stickers) : null;
             entry.paintPath = editState.paintPath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
             paintingOverlay.setEntities(entry.mediaEntities = editState.mediaEntities = entities == null || entities.isEmpty() ? null : entities, isCurrentVideo, true, sendPhotoType != SELECT_TYPE_STICKER);
             entry.averageDuration = editState.averageDuration = photoPaintView.getLcm();
             if (entry.mediaEntities != null && paintThumbBitmap[0] != null) {
-                size = ImageLoader.scaleAndSaveImage(paintThumbBitmap[0], Bitmap.CompressFormat.PNG, AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
+                size = ImageLoader.scaleAndSaveImage(currentAccount, paintThumbBitmap[0], Bitmap.CompressFormat.PNG, AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
                 entry.fullPaintPath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
             } else {
                 entry.fullPaintPath = entry.paintPath;
@@ -11648,13 +11649,13 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
             }
             if (!isCurrentVideo || entry.isLivePhoto()) {
                 if (hasAnimatedMediaEntities()) {
-                    size = ImageLoader.scaleAndSaveImage(croppedBitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
+                    size = ImageLoader.scaleAndSaveImage(currentAccount, croppedBitmap, getCompressFormat(), AndroidUtilities.getPhotoSize(), AndroidUtilities.getPhotoSize(), 87, false, 101, 101);
                     entry.imagePath = currentImagePath = FileLoader.getInstance(currentAccount).getPathToAttach(size, true).toString();
                 } else {
-                    mergeImages(entry.imagePath = getTempFileAbsolutePath(), null, croppedBitmap, paintBitmap, AndroidUtilities.getPhotoSize(), false);
+                    mergeImages(entry.imagePath = getTempFileAbsolutePath(currentAccount), null, croppedBitmap, paintBitmap, AndroidUtilities.getPhotoSize(), false);
                 }
             }
-            mergeImages(entry.thumbPath = getTempFileAbsolutePath(), null, croppedBitmap, paintBitmap, thumbSize, false);
+            mergeImages(entry.thumbPath = getTempFileAbsolutePath(currentAccount), null, croppedBitmap, paintBitmap, thumbSize, false);
 
             if (recycle && paintBitmap != null) {
                 paintBitmap.recycle();
@@ -16426,15 +16427,15 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                     if (botInlineResult.document != null) {
                         f1 = FileLoader.getInstance(currentAccount).getPathToAttach(botInlineResult.document);
                     } else if (botInlineResult.content instanceof TLRPC.TL_webDocument) {
-                        f1 = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE), Utilities.MD5(botInlineResult.content.url) + "." + ImageLoader.getHttpUrlExtension(botInlineResult.content.url, "mp4"));
+                        f1 = new File(FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_CACHE), Utilities.MD5(botInlineResult.content.url) + "." + ImageLoader.getHttpUrlExtension(botInlineResult.content.url, "mp4"));
                     }
                     isVideo = true;
                 } else if (botInlineResult.document != null) {
-                    f1 = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_DOCUMENT), currentFileNames[a]);
+                    f1 = new File(FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_DOCUMENT), currentFileNames[a]);
                 } else if (botInlineResult.photo != null) {
-                    f1 = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_IMAGE), currentFileNames[a]);
+                    f1 = new File(FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_IMAGE), currentFileNames[a]);
                 }
-                f2 = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE), currentFileNames[a]);
+                f2 = new File(FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_CACHE), currentFileNames[a]);
             } else if (currentFileLocation != null) {
                 if (index < 0 || index >= imagesArrLocationsVideo.size()) {
                     photoProgressViews[a].setBackgroundState(PROGRESS_NONE, animated, true);
@@ -16454,8 +16455,8 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                 f1 = FileLoader.getInstance(currentAccount).getPathToAttach(location, true);
                 f2 = FileLoader.getInstance(currentAccount).getPathToAttach(location, false);
             } else if (currentPathObject != null) {
-                f1 = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_DOCUMENT), currentFileNames[a]);
-                f2 = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE), currentFileNames[a]);
+                f1 = new File(FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_DOCUMENT), currentFileNames[a]);
+                f2 = new File(FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_CACHE), currentFileNames[a]);
             } else if (pageBlocksAdapter != null) {
                 f1 = pageBlocksAdapter.getFile(index);
                 isVideo = pageBlocksAdapter.isVideo(index) || pageBlocksAdapter.isHardwarePlayer(index);
@@ -17414,6 +17415,8 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         padImageForHorizontalInsets = true;
     }
 
+    private NotificationCenter.ObserversGroup observersGroup;
+
     public boolean openPhoto(final MessageObject messageObject, final TLRPC.FileLocation fileLocation, final ImageLocation imageLocation, final ImageLocation videoLocation, final ArrayList<MessageObject> messages, final ArrayList<SecureDocument> documents, final ArrayList<Object> photos, final int index, final PhotoViewerProvider provider, ChatActivity chatActivity, long dialogId, long mDialogId, long topicId, boolean fullScreenVideo, PageBlocksAdapter pageBlocksAdapter, Integer embedSeekTime) {
         if (parentActivity == null || isVisible || provider == null && checkAnimation() || messageObject == null && fileLocation == null && messages == null && photos == null && documents == null && imageLocation == null && pageBlocksAdapter == null) {
             return false;
@@ -17497,19 +17500,26 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
         }
         actionBar.setTitleScrollNonFitText(false);
 
-        NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.fileLoadFailed);
-        NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.fileLoaded);
-        NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.customStickerCreated);
-        NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.fileLoadProgressChanged);
-        NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.mediaCountDidLoad);
-        NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.mediaDidLoad);
-        NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.dialogPhotosUpdate);
-        NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.messagesDeleted);
-        NotificationCenter.getGlobalInstance().addObserver(this, NotificationCenter.emojiLoaded);
-        NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.filePreparingFailed);
-        NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.fileNewChunkAvailable);
-        NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.replaceMessagesObjects);
-        NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.dialogDeleted);
+        if (observersGroup != null) {
+            observersGroup.removeAllObservers();
+            observersGroup = null;
+        }
+
+        observersGroup = NotificationCenter.getInstance(currentAccount)
+            .createWeakObserversGroup(this)
+            .addGlobal(NotificationCenter.emojiLoaded)
+            .add(NotificationCenter.fileLoadFailed)
+            .add(NotificationCenter.fileLoaded)
+            .add(NotificationCenter.customStickerCreated)
+            .add(NotificationCenter.fileLoadProgressChanged)
+            .add(NotificationCenter.mediaCountDidLoad)
+            .add(NotificationCenter.mediaDidLoad)
+            .add(NotificationCenter.dialogPhotosUpdate)
+            .add(NotificationCenter.messagesDeleted)
+            .add(NotificationCenter.filePreparingFailed)
+            .add(NotificationCenter.fileNewChunkAvailable)
+            .add(NotificationCenter.replaceMessagesObjects)
+            .add(NotificationCenter.dialogDeleted);
 
         placeProvider = provider;
         mergeDialogId = mDialogId;
@@ -18595,19 +18605,11 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
     }
 
     private void removeObservers() {
-        NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.fileLoadFailed);
-        NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.fileLoaded);
-        NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.customStickerCreated);
-        NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.fileLoadProgressChanged);
-        NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.mediaCountDidLoad);
-        NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.mediaDidLoad);
-        NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.dialogPhotosUpdate);
-        NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.messagesDeleted);
-        NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.emojiLoaded);
-        NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.filePreparingFailed);
-        NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.fileNewChunkAvailable);
-        NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.replaceMessagesObjects);
-        NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.dialogDeleted);
+        if (observersGroup != null) {
+            observersGroup.removeAllObservers();
+            observersGroup = null;
+        }
+
         ConnectionsManager.getInstance(currentAccount).cancelRequestsForGuid(classGuid);
     }
 
@@ -20602,7 +20604,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                     file = null;
                 }
             } else if (currentBotInlineResult.content instanceof TLRPC.TL_webDocument) {
-                file = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE), Utilities.MD5(currentBotInlineResult.content.url) + "." + ImageLoader.getHttpUrlExtension(currentBotInlineResult.content.url, "mp4"));
+                file = new File(FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_CACHE), Utilities.MD5(currentBotInlineResult.content.url) + "." + ImageLoader.getHttpUrlExtension(currentBotInlineResult.content.url, "mp4"));
                 if (!file.exists()) {
                     file = null;
                 }
@@ -20644,10 +20646,10 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                             FileLoader.getInstance(currentAccount).cancelLoadFile(currentBotInlineResult.document);
                         }
                     } else if (currentBotInlineResult.content instanceof TLRPC.TL_webDocument) {
-                        if (!ImageLoader.getInstance().isLoadingHttpFile(currentBotInlineResult.content.url)) {
+                        if (!ImageLoader.getInstance().isLoadingHttpFile(currentAccount, currentBotInlineResult.content.url)) {
                             ImageLoader.getInstance().loadHttpFile(currentBotInlineResult.content.url, "mp4", currentAccount);
                         } else {
-                            ImageLoader.getInstance().cancelLoadHttpFile(currentBotInlineResult.content.url);
+                            ImageLoader.getInstance().cancelLoadHttpFile(currentAccount, currentBotInlineResult.content.url);
                         }
                     }
                 } else if (pageBlocksAdapter != null) {
@@ -21360,7 +21362,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                     message.action = new TLRPC.TL_messageActionEmpty();
                     message.dialog_id = currentDialogId;
                     videoPreviewMessageObject = new MessageObject(UserConfig.selectedAccount, message, false, false);
-                    videoPreviewMessageObject.messageOwner.attachPath = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE), "video_preview.mp4").getAbsolutePath();
+                    videoPreviewMessageObject.messageOwner.attachPath = new File(FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_CACHE), "video_preview.mp4").getAbsolutePath();
                     videoPreviewMessageObject.videoEditedInfo = new VideoEditedInfo();
                     videoPreviewMessageObject.videoEditedInfo.rotationValue = rotationValue;
                     videoPreviewMessageObject.videoEditedInfo.originalWidth = originalWidth;

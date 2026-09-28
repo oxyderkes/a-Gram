@@ -15,6 +15,7 @@
 #include <sys/epoll.h>
 #include <map>
 #include <atomic>
+#include <mutex>
 #include <unordered_set>
 #include "Defines.h"
 
@@ -67,7 +68,10 @@ public:
     void pauseNetwork();
     void setNetworkAvailable(bool value, int32_t type, bool slow);
     void setIpStrategy(uint8_t value);
-    void init(uint32_t version, int32_t layer, int32_t apiId, std::string deviceModel, std::string systemVersion, std::string appVersion, std::string langCode, std::string systemLangCode, std::string configPath, std::string logPath, std::string regId, std::string cFingerprint, std::string installerId, std::string packageId, int32_t timezoneOffset, int64_t userId, bool userPremium, bool isPaused, bool enablePushConnection, bool hasNetwork, int32_t networkType, int32_t performanceClass);
+    void init(uint32_t version, int32_t layer, int32_t apiId, std::string deviceModel, std::string systemVersion, std::string appVersion, std::string langCode, std::string systemLangCode, std::string configPath, std::string logPath, std::string regId, std::string cFingerprint, std::string installerId, std::string packageId, int32_t timezoneOffset, int64_t userId, bool userPremium, bool isPaused, bool enablePushConnection, bool hasNetwork, int32_t networkType, int32_t performanceClass, std::string containerOwnerId, bool retirementPending);
+    bool isContainerOwnerReady(const std::string &expectedOwnerId);
+    std::string getContainerOwner();
+    void transitionContainerOwner(std::string expectedOwnerId, std::string newOwnerId, std::function<void(bool)> completion);
     void setProxySettings(std::string address, uint16_t port, std::string username, std::string password, std::string secret);
     void setLangCode(std::string langCode);
     void setRegId(std::string regId);
@@ -94,8 +98,10 @@ private:
 
     void initDatacenters();
     void loadConfig();
-    void saveConfig();
-    void saveConfigInternal(NativeByteBuffer *buffer);
+    bool saveConfig(const std::string *ownerTransition = nullptr);
+    void saveConfigInternal(NativeByteBuffer *buffer, const std::string &ownerId);
+    void retireContainerTransport();
+    void quarantineContainerTransport();
     void select();
     void wakeup();
     void processServerResponse(TLObject *message, int64_t messageId, int32_t messageSeqNo, int64_t messageSalt, Connection *connection, int64_t innerMsgId, int64_t containerMessageId);
@@ -116,7 +122,7 @@ private:
     int32_t sendRequestInternal(TLObject *object, onCompleteFunc onComplete, onQuickAckFunc onQuickAck, onRequestClearFunc onClear, uint32_t flags, uint32_t datacenterId, ConnectionType connetionType, bool immediate);
 
     void checkPendingTasks();
-    void scheduleTask(std::function<void()> task);
+    void scheduleTask(std::function<void()> task, std::function<void()> onRetired = nullptr, bool ownerIndependent = false);
     void scheduleEvent(EventObject *eventObject, uint32_t time);
     void removeEvent(EventObject *eventObject);
     void onConnectionClosed(Connection *connection, int reason);
@@ -241,6 +247,16 @@ private:
     std::string currentLogPath;
     int64_t currentUserId = 0;
     bool localAuthConfigQuarantined = false;
+    // UUID ownership is distinct from app labels and server authorization. The
+    // atomic barrier is consulted even by pre-login/handshake connection paths.
+    std::atomic<bool> containerOwnerPaused{true};
+    bool containerOwnerAwaitingResume = false;
+    std::atomic<uint64_t> containerOwnerEpoch{0};
+    std::mutex containerOwnerMutex;
+    std::string containerOwnerId;
+    std::string expectedStartupOwnerId;
+    bool startupRetirementPending = false;
+    bool containerOwnerTransitionPending = false;
     bool currentUserPremium = false;
     bool registeredForInternalPush = false;
     bool pushConnectionEnabled = true;

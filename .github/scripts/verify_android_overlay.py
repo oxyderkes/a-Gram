@@ -29,11 +29,6 @@ secure_store = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramSec
 push_controller = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramPushController.java")
 network_controller = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramNetworkController.java")
 deleted_media_store = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramDeletedMediaStore.java")
-chat_export = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramChatExportManager.java")
-chat_export_pdf = read("TMessagesProj/src/main/java/org/telegram/messenger/AgramHtmlPdfRenderer.java")
-chat_export_style = read("TMessagesProj/src/main/assets/agram_export/style.css")
-strings_en = read("TMessagesProj/src/main/res/values/strings.xml")
-strings_ru = read("TMessagesProj/src/main/res/values-ru/strings.xml")
 messages_storage = read("TMessagesProj/src/main/java/org/telegram/messenger/MessagesStorage.java")
 file_loader = read("TMessagesProj/src/main/java/org/telegram/messenger/FileLoader.java")
 image_loader = read("TMessagesProj/src/main/java/org/telegram/messenger/ImageLoader.java")
@@ -49,6 +44,8 @@ chat_activity = read("TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.j
 launch_activity = read("TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java")
 application_loader = read("TMessagesProj/src/main/java/org/telegram/messenger/ApplicationLoader.java")
 user_config = read("TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java")
+if "other.isClientActivated() || other.hasPersistedSession()" not in user_config:
+    errors.append("logout must preserve shared app protection while another persisted session is unloaded")
 intro_activity = read("TMessagesProj/src/main/java/org/telegram/ui/IntroActivity.java")
 native_config = read("TMessagesProj/jni/tgnet/Config.cpp")
 native_connections = read("TMessagesProj/jni/tgnet/ConnectionsManager.cpp")
@@ -59,8 +56,52 @@ for label, source in (("core", core_gradle), ("standalone", standalone_gradle)):
     if not re.search(r"minSdkVersion\s+26\b", source):
         errors.append(f"{label} module must keep minSdkVersion 26")
 
-if not re.search(r"(?m)^APP_VERSION_NAME=12\.10\.1-a-gram\.24\s*$", gradle_properties):
-    errors.append("Android overlay version must be 12.10.1-a-gram.24")
+if not re.search(r"(?m)^APP_VERSION_NAME=12\.10\.5-a-gram\.26-test\.6\s*$", gradle_properties):
+    errors.append("Android overlay version must be 12.10.5-a-gram.26-test.6")
+if not re.search(r"(?m)^APP_VERSION_CODE=7111\s*$", gradle_properties):
+    errors.append("Every new APK must have a higher, unique Android version code")
+
+# Restore the prior single-scroll UI without reverting safer session/settings behavior.
+for removed_navigation in ("pageBodies", "pageTitles", "visiblePage", "showPage("):
+    if removed_navigation in container_setup:
+        errors.append(f"multipage account-settings navigation returned: {removed_navigation}")
+settings_cards = [f"add{name}Card(context, content);" for name in
+                  ("Profile", "Network", "Push", "Ghost", "Security", "Archive")]
+positions = [container_setup.find(card) for card in settings_cards]
+if -1 in positions or positions != sorted(positions):
+    errors.append("single-scroll settings card order is incomplete or changed")
+for required_ui in ('"Настройки аккаунта"', '"Перед входом"', '"Сохранять удалённые"',
+                    "content.addView(continueButton", "TextCheckCell", "RadioButtonCell"):
+    if required_ui not in container_setup:
+        errors.append(f"single-scroll themed settings UI guard missing: {required_ui}")
+for required_guard in ("ContainerPersistenceException", "record.isStorageAccessible()",
+                       "settingsQueue.postRunnable", "runBoundSettingsUpdate(account, containerId",
+                       "if (saving || !sameContainer()) return;", '"Несохранённые изменения"',
+                       "applyLockedProfileState();", "refreshArchiveStatus();"):
+    if required_guard not in container_setup:
+        errors.append(f"settings restoration lost safety guard: {required_guard}")
+if "com.android.tools.build:gradle:8.13.2" not in root_gradle:
+    errors.append("Telegram 12.10.5 requires Android Gradle Plugin 8.13.2")
+if "SUPPORTS_PASSKEYS = false" not in read("TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java"):
+    errors.append("Official-app-only passkey support must stay disabled in this fork")
+for removed in ("AgramChatExportManager.java", "AgramHtmlPdfRenderer.java"):
+    if (ANDROID / "TMessagesProj/src/main/java/org/telegram/messenger" / removed).exists():
+        errors.append(f"experimental chat export returned: {removed}")
+if "canOfferAgramExport" in chat_activity:
+    errors.append("experimental export entry point returned")
+if "AgramPushState.registration" not in messages_controller or "AgramPushState.stream" not in push_controller:
+    errors.append("push transport and Telegram registration must use independent runtime states")
+if 'configured = "https://ntfy.sh"' in push_controller:
+    errors.append("invalid runtime Push config must fail rather than silently change relays")
+if "onProxyError(final int account)" not in java_connections or "onProxyError(int account)" not in network_controller:
+    errors.append("proxy failures must preserve account identity")
+if "WebProxyTransport" in java_connections or "WebProxyConnectionTester" in java_connections:
+    errors.append("process-global WEB proxy transport must not bypass container isolation")
+if "if (!isProxyTypeSupported(settings))" not in java_connections:
+    errors.append("unsupported WEB proxy application must preserve the active container route")
+for proxy_ui in ("ProxySettingsActivity.java", "ProxyListActivity.java"):
+    if "notifyUnsupportedWebProxy" not in read("TMessagesProj/src/main/java/org/telegram/ui/" + proxy_ui):
+        errors.append(f"unsupported WEB proxy notice missing from {proxy_ui}")
 
 if not re.search(r'buildConfigField\s+"int",\s*"TELEGRAM_APP_ID",\s*configuredApiId\s*\?\s*configuredApiId\s*:\s*"0"', core_gradle):
     errors.append("production API ID must not have a public fallback")
@@ -166,8 +207,15 @@ if "PUSH_INSTANCE_HASH_PREFIX" not in container_manager or "readPushInstance" in
     errors.append("push identity checks must not decrypt every container")
 if "purgeOrphanedContainers()" in application_loader:
     errors.append("cold start must not infer logout and delete containers")
-if "deleteContainer(currentAccount)" not in messages_controller:
-    errors.append("confirmed logout container cleanup is missing")
+for source, guard in (
+    (messages_controller, "prepareNativeRetirement(currentAccount, leavingContainerId)"),
+    (messages_controller, "connections.retireAgramContainer("),
+    (java_connections, "manager.acknowledgeNativeRetirement(currentAccount, previous)"),
+    (java_connections, "manager.deleteContainer(currentAccount, previous)"),
+    (container_manager, "NATIVE_RETIRED_PREFIX"),
+):
+    if guard not in source:
+        errors.append(f"durably acknowledged logout container cleanup is missing: {guard}")
 
 required_account_selection_guards = (
     (user_config, "ACCOUNT_SELECTION_PREFERENCES"),
@@ -187,7 +235,9 @@ required_session_persistence_guards = (
     (native_config, "isValidConfigFile"),
     (native_config, "configValid && backupValid"),
     (native_config, "remove(backupPath.c_str())"),
-    (native_connections, "LogoutReasonLocalConfigMismatch"),
+    (native_connections, "quarantineContainerTransport()"),
+    (native_connections, "AgramNativeOwnerPolicy::startup"),
+    (java_connections, "native_isContainerOwnerReady(currentAccount, containerOwnerId)"),
     (native_connections, "localAuthConfigQuarantined"),
     (java_connections, "LogoutReasonServerAuthRejected"),
     (java_connections, "sessionAuthConfigMismatch"),
@@ -228,111 +278,6 @@ required_retention_guards = (
 for guard in required_retention_guards:
     if guard not in message_object:
         errors.append(f"ordinary-message retention safety guard is missing: {guard}")
-
-required_chat_export_guards = (
-    "DialogObject.isEncryptedDialog(sourceDialogId)",
-    "isPeerNoForwards(sourceDialogId)",
-    "MessageObject.canKeepDeletedOnServer(message, sourceDialogId)",
-    "getAgramDeletedMessagesForExportPage(",
-    "SQLiteDatabase.openOrCreateDatabase",
-    "PRIMARY KEY(source_dialog_id, mid)",
-    "getPathToMessage(message, false)",
-    "agram_chat_exports",
-    "new DispatchQueue(\"agramChatExport-\"",
-    "exportQueue.postRunnable",
-    "users.clear()",
-    "chats.clear()",
-    "page.hasError()",
-    "page.finished",
-    "page.nextCursor",
-    "mergeDialogId",
-    "areSourceDialogsExportable()",
-    "enum Format",
-    "HTML_ZIP",
-    "format == Format.PDF",
-    "AgramHtmlPdfRenderer.render(",
-    "pdfRenderTask",
-    "renderTask.cancel()",
-    "baseName + \".pdf\"",
-    "isSessionValid()",
-    "containerId",
-    "RETIRED_CONTAINERS",
-)
-for guard in required_chat_export_guards:
-    if guard not in chat_export:
-        errors.append(f"chat export safety/performance guard is missing: {guard}")
-if "AndroidUtilities.getSharingDirectory()" in chat_export:
-    errors.append("chat exports must not use the cross-container sharing directory")
-if "Utilities.globalQueue" in chat_export:
-    errors.append("chat export orchestration must use its own serial DispatchQueue")
-if 'loading=\\"lazy\\"' not in chat_export or 'loading=\\"eager\\"' in chat_export:
-    errors.append("chat export images must use native lazy loading")
-pdf_branch = re.search(
-    r"if\s*\(format\s*==\s*Format\.PDF\)\s*\{(?P<body>.*?)\n\s*\}",
-    chat_export,
-    re.DOTALL,
-)
-if pdf_branch is None or "startPdfRender(" not in pdf_branch.group("body"):
-    errors.append("PDF export must branch into the asynchronous HTML-to-PDF renderer")
-elif "zipDirectory(" in pdf_branch.group("body"):
-    errors.append("PDF export must not package its staging directory as ZIP")
-required_pdf_renderer_guards = (
-    "interface Callback",
-    "class RenderTask",
-    "static RenderTask render(",
-    "new PdfDocument()",
-    "PAGE_WIDTH_POINTS = 595",
-    "PAGE_HEIGHT_POINTS = 842",
-    "MAX_PDF_PAGES = 150",
-    "pageImageWaitScript(",
-    "temporaryOutputFile.renameTo(outputFile)",
-)
-for guard in required_pdf_renderer_guards:
-    if guard not in chat_export_pdf:
-        errors.append(f"HTML-to-PDF renderer guard is missing: {guard}")
-if "PrintDocumentAdapter" in chat_export_pdf:
-    errors.append("PDF renderer must not use inaccessible PrintDocumentAdapter callbacks")
-if not re.search(r"@page\s*\{[^}]*size:\s*A4\s*;[^}]*margin:\s*12mm\s+10mm\s*;", chat_export_style, re.DOTALL):
-    errors.append("chat export print CSS must retain A4 page size and margins")
-if not re.search(r"\.message\.deleted\s*\{[^}]*opacity:\s*\.?(?:40|4)\s*;", chat_export_style, re.DOTALL):
-    errors.append("deleted messages in HTML export must render at 40% opacity")
-if not re.search(
-    r'<cache-path\b(?=[^>]*\bname="agram_chat_exports")(?=[^>]*\bpath="agram_chat_exports/")[^>]*/?>',
-    provider_paths,
-):
-    errors.append("FileProvider must expose only the dedicated chat-export cache subtree")
-if "AgramChatExportManager.purgeContainerCache(id)" not in container_manager:
-    errors.append("container removal must purge its share-ready chat exports")
-if not all(
-    guard in chat_activity
-    for guard in (
-        "canOfferAgramExport()",
-        "currentEncryptedChat != null",
-        "isPeerNoForwards()",
-        "userInfo != null",
-        "showAgramExportParticipantPicker()",
-        "pickAgramExportDateRange(",
-        "showAgramExportFormatChoice(",
-        "AgramChatExportManager.Format.PDF",
-        "AgramChatExportManager.start(currentAccount, dialog_id, mergeDialogId,",
-        '"application/pdf"',
-        '"application/zip"',
-    )
-):
-    errors.append("chat export UI must retain its scope, date and protected-chat guards")
-for name in (
-    "AGramExportChooseFormat",
-    "AGramExportFormatHtml",
-    "AGramExportFormatPdf",
-    "AGramExportStageHistory",
-    "AGramExportStageDeleted",
-    "AGramExportStageHtml",
-    "AGramExportStageZip",
-    "AGramExportStagePdf",
-):
-    marker = f'name="{name}"'
-    if marker not in strings_en or marker not in strings_ru:
-        errors.append(f"localized chat export string is missing: {name}")
 
 required_deleted_media_store_guards = (
     "deleted_media",
@@ -456,7 +401,7 @@ else:
     ):
         errors.append("AudioPlayerCell zero-length cleanup must not bypass pending archive protection")
 container_delete = re.search(
-    r"public\s+void\s+deleteContainer\s*\(int\s+account\).*?(?=\n\s*public\s)",
+    r"public\s+boolean\s+deleteContainer\s*\(int\s+account,\s*String\s+expectedId\).*?(?=\n\s*public\s)",
     container_manager,
     re.DOTALL,
 )
@@ -526,6 +471,17 @@ for source, hook in required_ghost_hooks:
 for removed_false_code_hook in ("resolvePinTarget", "Legend target", "ложн"):
     if removed_false_code_hook in container_manager or removed_false_code_hook in launch_activity:
         errors.append(f"removed false-code feature returned: {removed_false_code_hook}")
+
+# These are source invariants, not substitutes for the JVM and device regression gates.
+for invariant in ("return copyRecord(cached)", "recordCache.put(record.account, copyRecord(record))",
+                  "verifyPinAsync", "runBoundSettingsUpdate"):
+    if invariant not in container_manager:
+        errors.append(f"container persistence/protection invariant missing: {invariant}")
+for invariant in ("resumeContainerProtection", "deferIntentUntilContainerUnlock", "verifyPinAsync"):
+    if invariant not in launch_activity:
+        errors.append(f"container entry protection invariant missing: {invariant}")
+if "local_auth_unavailable" not in java_connections:
+    errors.append("local auth quarantine must remain distinguishable from network failure")
 
 tracked_text = "\n".join(
     path.read_text(encoding="utf-8", errors="ignore")

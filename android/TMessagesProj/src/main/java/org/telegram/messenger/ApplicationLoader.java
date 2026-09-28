@@ -36,6 +36,7 @@ import com.google.android.gms.common.ConnectionResult;
 import com.google.android.gms.common.GooglePlayServicesUtil;
 
 import org.json.JSONObject;
+import org.telegram.messenger.utils.Choreographer60FpsContent;
 import org.telegram.messenger.voip.VideoCapturerDevice;
 import org.telegram.tgnet.ConnectionsManager;
 import org.telegram.tgnet.TLRPC;
@@ -353,7 +354,6 @@ public class ApplicationLoader extends Application {
         // Never infer a logout during cold start: Telegram may still be
         // restoring a session. Confirmed logout paths delete their container.
         ensureAccountInitialized(startupAccount);
-        SharedConfig.pushStringStatus = "__FIREBASE_GENERATING_SINCE_" + ConnectionsManager.getInstance(startupAccount).getCurrentTime() + "__";
 
         ApplicationLoader app = (ApplicationLoader) ApplicationLoader.applicationContext;
         app.initPushServices();
@@ -449,7 +449,15 @@ public class ApplicationLoader extends Application {
 
         LauncherIconController.tryFixLauncherIconIfNeeded();
         ProxyRotationController.init();
+
+        //if (BuildConfig.DEBUG_PRIVATE_VERSION) {
+        //    Choreographer60FpsContent.getInstance().addFrameCallback(debugEverySecondChecks, 1);
+        //}
     }
+
+    private final Runnable debugEverySecondChecks = () -> AndroidUtilities.runOnUIThread(() -> {
+        NotificationCenter.sanitize();
+    });
 
     public static void startPushService() {
         SharedPreferences preferences = MessagesController.getGlobalNotificationsSettings();
@@ -485,20 +493,12 @@ public class ApplicationLoader extends Application {
 
     private void initPushServices() {
         AndroidUtilities.runOnUIThread(() -> {
-            if (getPushProvider().hasServices()) {
-                getPushProvider().onRequestPushToken();
-            } else {
-                if (BuildVars.LOGS_ENABLED) {
-                    FileLog.d("No valid " + getPushProvider().getLogTitle() + " APK found.");
-                }
-                MessagesController.getGlobalNotificationsSettings()
-                        .edit()
-                        .putBoolean("pushService", true)
-                        .apply();
-                startPushService();
-                SharedConfig.pushStringStatus = "__NO_GOOGLE_PLAY_SERVICES__";
-                PushListenerController.sendRegistrationToServer(getPushProvider().getPushType(), null);
-            }
+            SharedConfig.clearLegacyPushState();
+            MessagesController.getGlobalNotificationsSettings()
+                    .edit()
+                    .putBoolean("pushService", true)
+                    .apply();
+            startPushService();
         }, 1000);
     }
 

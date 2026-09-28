@@ -5,11 +5,19 @@ on:
     paths:
       - "android/**"
       - ".github/scripts/verify_android_overlay.py"
+      - ".github/scripts/run_android_regressions.py"
+      - ".github/scripts/verify_android_themes.py"
+      - ".gitattributes"
+      - ".github/tests/**"
       - ".github/workflows/android-overlay-security.yml"
   pull_request:
     paths:
       - "android/**"
       - ".github/scripts/verify_android_overlay.py"
+      - ".github/scripts/run_android_regressions.py"
+      - ".github/scripts/verify_android_themes.py"
+      - ".gitattributes"
+      - ".github/tests/**"
       - ".github/workflows/android-overlay-security.yml"
 
 permissions:
@@ -23,5 +31,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
       - name: Verify credentials, permissions, backup and retention boundaries
         run: python .github/scripts/verify_android_overlay.py
+      - name: Run production state-machine regressions
+        run: python .github/scripts/run_android_regressions.py
+      - name: Verify byte-exact bundled themes and CRLF-safe parsing
+        run: python .github/scripts/verify_android_themes.py

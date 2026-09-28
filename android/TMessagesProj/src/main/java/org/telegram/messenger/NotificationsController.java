@@ -137,6 +137,7 @@ public class NotificationsController extends BaseController implements Notificat
 
     private Boolean groupsCreated;
     private boolean channelGroupsCreated;
+    private int appliedAgramNotificationPrivacy = Integer.MIN_VALUE;
 
     public static long globalSecretChatId = DialogObject.makeEncryptedDialogId(1);
 
@@ -372,6 +373,7 @@ public class NotificationsController extends BaseController implements Notificat
         popupMessages.clear();
         popupReplyMessages.clear();
         channelGroupsCreated = false;
+        appliedAgramNotificationPrivacy = Integer.MIN_VALUE;
         notificationsQueue.postRunnable(() -> {
             openedDialogId = 0;
             openedTopicId = 0;
@@ -3662,9 +3664,52 @@ public class NotificationsController extends BaseController implements Notificat
         return null;
     }
 
+    private boolean isAgramNotificationIdentityHidden() {
+        return AgramContainerManager.getInstance().ensureContainer(currentAccount).notificationPrivacy
+                == AgramContainerManager.NOTIFICATION_HIDDEN;
+    }
+
+    /** Applies a changed container privacy mode without resetting channel settings. */
+    public void refreshAgramNotificationPrivacy() {
+        if (Build.VERSION.SDK_INT < 26) {
+            return;
+        }
+        notificationsQueue.postRunnable(() -> {
+            appliedAgramNotificationPrivacy = Integer.MIN_VALUE;
+            ensureGroupsCreated();
+        });
+    }
+
+    @TargetApi(26)
+    private void applyAgramNotificationPrivacyIfNeeded() {
+        final int privacy = AgramContainerManager.getInstance().ensureContainer(currentAccount).notificationPrivacy;
+        if (appliedAgramNotificationPrivacy == privacy) {
+            return;
+        }
+        appliedAgramNotificationPrivacy = privacy;
+        channelGroupsCreated = false;
+        if (privacy != AgramContainerManager.NOTIFICATION_HIDDEN) {
+            return;
+        }
+        final String privateName = LocaleController.getString(R.string.AppName);
+        final String channelPrefix = currentAccount + "channel";
+        try {
+            for (NotificationChannel channel : systemNotificationManager.getNotificationChannels()) {
+                if (channel.getId().startsWith(channelPrefix)
+                        && !TextUtils.equals(channel.getName(), privateName)) {
+                    channel.setName(privateName);
+                    systemNotificationManager.createNotificationChannel(channel);
+                }
+            }
+        } catch (Exception e) {
+            FileLog.e(e);
+        }
+    }
+
     @TargetApi(26)
     protected void ensureGroupsCreated() {
         SharedPreferences preferences = getAccountInstance().getNotificationsSettings();
+        applyAgramNotificationPrivacyIfNeeded();
         if (groupsCreated == null) {
             groupsCreated = preferences.getBoolean("groupsCreated5", false);
         }
@@ -3726,68 +3771,29 @@ public class NotificationsController extends BaseController implements Notificat
             groupsCreated = true;
         }
         if (!channelGroupsCreated) {
-            List<NotificationChannelGroup> list = systemNotificationManager.getNotificationChannelGroups();
-            String channelsId = "channels" + currentAccount;
-            String groupsId = "groups" + currentAccount;
-            String privateId = "private" + currentAccount;
-            String storiesId = "stories" + currentAccount;
-            String reactionsId = "reactions" + currentAccount;
-            String otherId = "other" + currentAccount;
-            for (int a = 0, N = list.size(); a < N; a++) {
-                String id = list.get(a).getId();
-                if (channelsId != null && channelsId.equals(id)) {
-                    channelsId = null;
-                } else if (groupsId != null && groupsId.equals(id)) {
-                    groupsId = null;
-                } else if (storiesId != null && storiesId.equals(id)) {
-                    storiesId = null;
-                } else if (reactionsId != null && reactionsId.equals(id)) {
-                    reactionsId = null;
-                } else if (privateId != null && privateId.equals(id)) {
-                    privateId = null;
-                } else if (otherId != null && otherId.equals(id)) {
-                    otherId = null;
-                }
-                if (channelsId == null && storiesId == null && reactionsId == null && groupsId == null && privateId == null && otherId == null) {
-                    break;
-                }
+            final boolean hideContainerIdentity = isAgramNotificationIdentityHidden();
+            TLRPC.User user = getMessagesController().getUser(getUserConfig().getClientUserId());
+            if (user == null) {
+                user = getUserConfig().getCurrentUser();
+            }
+            final String userName;
+            if (!hideContainerIdentity && user != null) {
+                userName = " (" + ContactsController.formatName(user.first_name, user.last_name) + ")";
+            } else {
+                userName = "";
             }
 
-            if (channelsId != null || groupsId != null || reactionsId != null || storiesId != null || privateId != null || otherId != null) {
-                final TLRPC.User user = getMessagesController().getUser(getUserConfig().getClientUserId());
-                if (user == null) {
-                    getUserConfig().getCurrentUser();
-                }
-                String userName;
-                if (user != null) {
-                    userName = " (" + ContactsController.formatName(user.first_name, user.last_name) + ")";
-                } else {
-                    userName = "";
-                }
-
-                final ArrayList<NotificationChannelGroup> channelGroups = new ArrayList<>();
-                if (channelsId != null) {
-                    channelGroups.add(new NotificationChannelGroup(channelsId, LocaleController.getString(R.string.NotificationsChannels) + userName));
-                }
-                if (groupsId != null) {
-                    channelGroups.add(new NotificationChannelGroup(groupsId, LocaleController.getString(R.string.NotificationsGroups) + userName));
-                }
-                if (storiesId != null) {
-                    channelGroups.add(new NotificationChannelGroup(storiesId, LocaleController.getString(R.string.NotificationsStories) + userName));
-                }
-                if (reactionsId != null) {
-                    channelGroups.add(new NotificationChannelGroup(reactionsId, LocaleController.getString(R.string.NotificationsReactions) + userName));
-                }
-                if (privateId != null) {
-                    channelGroups.add(new NotificationChannelGroup(privateId, LocaleController.getString(R.string.NotificationsPrivateChats) + userName));
-                }
-                if (otherId != null) {
-                    channelGroups.add(new NotificationChannelGroup(otherId, LocaleController.getString(R.string.NotificationsOther) + userName));
-                }
-
-                systemNotificationManager.createNotificationChannelGroups(channelGroups);
-            }
-
+            // Recreating a group with the same id updates its user-visible name
+            // without replacing the user's channel settings. This also scrubs
+            // account names left by versions installed before hidden privacy.
+            final ArrayList<NotificationChannelGroup> channelGroups = new ArrayList<>();
+            channelGroups.add(new NotificationChannelGroup("channels" + currentAccount, LocaleController.getString(R.string.NotificationsChannels) + userName));
+            channelGroups.add(new NotificationChannelGroup("groups" + currentAccount, LocaleController.getString(R.string.NotificationsGroups) + userName));
+            channelGroups.add(new NotificationChannelGroup("stories" + currentAccount, LocaleController.getString(R.string.NotificationsStories) + userName));
+            channelGroups.add(new NotificationChannelGroup("reactions" + currentAccount, LocaleController.getString(R.string.NotificationsReactions) + userName));
+            channelGroups.add(new NotificationChannelGroup("private" + currentAccount, LocaleController.getString(R.string.NotificationsPrivateChats) + userName));
+            channelGroups.add(new NotificationChannelGroup("other" + currentAccount, LocaleController.getString(R.string.NotificationsOther) + userName));
+            systemNotificationManager.createNotificationChannelGroups(channelGroups);
             channelGroupsCreated = true;
         }
     }
@@ -3853,6 +3859,9 @@ public class NotificationsController extends BaseController implements Notificat
             key = (isInApp ? "org.telegram.keyia" : "org.telegram.key") + dialogId + "_" + topicId;
         }
         key += "_" + soundHash;
+        final String channelDisplayName = isAgramNotificationIdentityHidden()
+                ? LocaleController.getString(R.string.AppName)
+                : (secretChat ? LocaleController.getString(R.string.SecretChatName) : name);
         String channelId = preferences.getString(key, null);
         String settings = preferences.getString(key + "_s", null);
         boolean edited = false;
@@ -3865,6 +3874,10 @@ public class NotificationsController extends BaseController implements Notificat
                 FileLog.d("current channel for " + channelId + " = " + existingChannel);
             }
             if (existingChannel != null) {
+                if (!TextUtils.equals(existingChannel.getName(), channelDisplayName)) {
+                    existingChannel.setName(channelDisplayName);
+                    systemNotificationManager.createNotificationChannel(existingChannel);
+                }
                 if (!isSilent && !shouldOverwrite) {
                     int channelImportance = existingChannel.getImportance();
                     Uri channelSound = existingChannel.getSound();
@@ -4061,7 +4074,7 @@ public class NotificationsController extends BaseController implements Notificat
             } else {
                 channelId = currentAccount + "channel_" + dialogId + "_" + Utilities.random.nextLong();
             }
-            NotificationChannel notificationChannel = new NotificationChannel(channelId, secretChat ? LocaleController.getString(R.string.SecretChatName) : name, importance);
+            NotificationChannel notificationChannel = new NotificationChannel(channelId, channelDisplayName, importance);
             notificationChannel.setGroup(groupId);
             if (ledColor != 0) {
                 notificationChannel.enableLights(true);
@@ -4630,7 +4643,7 @@ public class NotificationsController extends BaseController implements Notificat
             if (largeBitmap != null) {
                 mBuilder.setLargeIcon(largeBitmap);
             } else if (photoPath != null) {
-                BitmapDrawable img = ImageLoader.getInstance().getImageFromMemory(photoPath, null, "50_50");
+                BitmapDrawable img = ImageLoader.getInstance().getImageFromMemory(currentAccount, photoPath, null, "50_50");
                 if (img != null) {
                     mBuilder.setLargeIcon(img.getBitmap());
                 } else {
@@ -4734,7 +4747,8 @@ public class NotificationsController extends BaseController implements Notificat
             }
 
             boolean hasCallback = false;
-            if (!AndroidUtilities.needShowPasscode() && !SharedConfig.isWaitingForPasscodeEnter && lastMessageObject.getDialogId() == 777000) {
+            if (!hideContainerPreview && !AndroidUtilities.needShowPasscode()
+                    && !SharedConfig.isWaitingForPasscodeEnter && lastMessageObject.getDialogId() == 777000) {
                 if (lastMessageObject.messageOwner.reply_markup instanceof TLRPC.TL_replyInlineMarkup) {
                     final TLRPC.TL_replyInlineMarkup replyInlineMarkup = (TLRPC.TL_replyInlineMarkup) lastMessageObject.messageOwner.reply_markup;
                     ArrayList<TL_keyboard.KeyboardInlineButtonRow> rows = replyInlineMarkup.rows;
@@ -5128,7 +5142,7 @@ public class NotificationsController extends BaseController implements Notificat
             if (photoPath != null) {
                 avatarFile = getFileLoader().getPathToAttach(photoPath, true);
                 if (Build.VERSION.SDK_INT < 28) {
-                    BitmapDrawable img = ImageLoader.getInstance().getImageFromMemory(photoPath, null, "50_50");
+                    BitmapDrawable img = ImageLoader.getInstance().getImageFromMemory(currentAccount, photoPath, null, "50_50");
                     if (img != null) {
                         avatarBitmap = img.getBitmap();
                     } else {
@@ -5667,7 +5681,7 @@ public class NotificationsController extends BaseController implements Notificat
                     if (copybutton != null) break;
                 }
             }
-            if (copybutton != null) {
+            if (!hideContainerPreview && copybutton != null) {
                 Intent copyIntent = new Intent(ApplicationLoader.applicationContext, CopyCodeReceiver.class);
                 copyIntent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
                 copyIntent.setAction(ApplicationLoader.getApplicationId() + ".ACTION_COPY_CODE");
@@ -5696,7 +5710,8 @@ public class NotificationsController extends BaseController implements Notificat
                 builder.setLargeIcon(avatarBitmap);
             }
 
-            if (!AndroidUtilities.needShowPasscode(false) && !SharedConfig.isWaitingForPasscodeEnter) {
+            if (!hideContainerPreview && !AndroidUtilities.needShowPasscode(false)
+                    && !SharedConfig.isWaitingForPasscodeEnter) {
                 if (rows != null) {
                     for (int r = 0, rc = rows.size(); r < rc; r++) {
                         TL_keyboard.KeyboardInlineButtonRow row = rows.get(r);
@@ -5718,7 +5733,7 @@ public class NotificationsController extends BaseController implements Notificat
                 }
             }
 
-            if (chat == null && user != null && user.phone != null && user.phone.length() > 0) {
+            if (!hideContainerIdentity && chat == null && user != null && user.phone != null && user.phone.length() > 0) {
                 builder.addPerson("tel:+" + user.phone);
             }
 
@@ -5766,7 +5781,8 @@ public class NotificationsController extends BaseController implements Notificat
         for (int a = 0, size = holders.size(); a < size; a++) {
             NotificationHolder holder = holders.get(a);
             ids.clear();
-            if (Build.VERSION.SDK_INT >= 29 && !DialogObject.isEncryptedDialog(holder.dialogId)) {
+            if (Build.VERSION.SDK_INT >= 29 && !hideContainerIdentity
+                    && !DialogObject.isEncryptedDialog(holder.dialogId)) {
                 String shortcutId = createNotificationShortcut(holder.notification, holder.dialogId, holder.name, holder.user, holder.chat, personCache.get(holder.dialogId), !holder.story);
                 if (shortcutId != null) {
                     ids.add(shortcutId);

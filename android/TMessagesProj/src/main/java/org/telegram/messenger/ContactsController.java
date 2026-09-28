@@ -111,7 +111,7 @@ public class ContactsController extends BaseController {
 
         private Runnable checkRunnable = () -> {
             for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
-                if (UserConfig.getInstance(a).isClientActivated()) {
+                if (UserConfig.getInstance(a).isContactSyncAllowed()) {
                     ConnectionsManager.getInstance(a).resumeNetworkMaybe();
                     ContactsController.getInstance(a).checkContacts();
                 }
@@ -464,7 +464,10 @@ public class ContactsController extends BaseController {
     }
 
     public void checkContacts() {
+        final long sessionGeneration = getUserConfig().getSessionGeneration();
+        final long consentGeneration = getUserConfig().getContactSyncGeneration();
         Utilities.globalQueue.postRunnable(() -> {
+            if (!isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) return;
             if (checkContactsInternal()) {
                 if (BuildVars.LOGS_ENABLED) {
                     FileLog.d("detected contacts change");
@@ -475,7 +478,10 @@ public class ContactsController extends BaseController {
     }
 
     public void forceImportContacts() {
+        final long sessionGeneration = getUserConfig().getSessionGeneration();
+        final long consentGeneration = getUserConfig().getContactSyncGeneration();
         Utilities.globalQueue.postRunnable(() -> {
+            if (!isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) return;
             if (BuildVars.LOGS_ENABLED) {
                 FileLog.d("force import contacts");
             }
@@ -569,6 +575,9 @@ public class ContactsController extends BaseController {
     }
 
     private boolean checkContactsInternal() {
+        if (!getUserConfig().isContactSyncAllowed()) {
+            return false;
+        }
         boolean reload = false;
         try {
             if (!hasContactsPermission()) {
@@ -630,7 +639,7 @@ public class ContactsController extends BaseController {
     }
 
     public HashMap<String, Contact> readContactsFromPhoneBook() {
-        if (!getUserConfig().syncContacts) {
+        if (!getUserConfig().isContactSyncAllowed()) {
             if (BuildVars.LOGS_ENABLED) {
                 FileLog.d("contacts sync disabled");
             }
@@ -999,11 +1008,27 @@ public class ContactsController extends BaseController {
         });
     }
 
+    private boolean isCurrentPhoneBookSync(long sessionGeneration, long consentGeneration) {
+        return getUserConfig().isSessionGenerationCurrent(sessionGeneration)
+                && getUserConfig().getContactSyncGeneration() == consentGeneration
+                && getUserConfig().isContactSyncAllowed();
+    }
+
     protected void performSyncPhoneBook(final HashMap<String, Contact> contactHashMap, final boolean request, final boolean first, final boolean schedule, final boolean force, final boolean checkCount, final boolean canceled) {
+        if (!getUserConfig().isContactSyncAllowed()) {
+            contactsSyncInProgress = false;
+            contactsBookLoaded = true;
+            return;
+        }
+        final long sessionGeneration = getUserConfig().getSessionGeneration();
+        final long consentGeneration = getUserConfig().getContactSyncGeneration();
         if (!first && !contactsBookLoaded) {
             return;
         }
         Utilities.globalQueue.postRunnable(() -> {
+            if (!isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) {
+                return;
+            }
             int newPhonebookContacts = 0;
             int serverContactsInPhonebook = 0;
             boolean disableDeletion = true; //disable contacts deletion, because phone numbers can't be compared due to different numbers format
@@ -1318,10 +1343,15 @@ public class ContactsController extends BaseController {
                         FileLog.d("new phone book contacts " + newPhonebookContacts + " serverContactsInPhonebook " + serverContactsInPhonebook + " totalContacts " + contactsByPhone.size());
                     }
                     if (checkType != 0) {
-                        AndroidUtilities.runOnUIThread(() -> getNotificationCenter().postNotificationName(NotificationCenter.hasNewContactsToImport, checkType, contactHashMap, first, schedule));
+                        AndroidUtilities.runOnUIThread(() -> {
+                            if (isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) {
+                                getNotificationCenter().postNotificationName(NotificationCenter.hasNewContactsToImport, checkType, contactHashMap, first, schedule);
+                            }
+                        });
                         return;
                     } else if (canceled) {
                         Utilities.stageQueue.postRunnable(() -> {
+                            if (!isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) return;
                             contactsBookSPhones = contactsBookShort;
                             contactsBook = contactsMap;
                             contactsSyncInProgress = false;
@@ -1335,6 +1365,7 @@ public class ContactsController extends BaseController {
                             }
                             getMessagesStorage().putCachedPhoneBook(contactsMap, false, false);
                             AndroidUtilities.runOnUIThread(() -> {
+                                if (!isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) return;
                                 mergePhonebookAndTelegramContacts(phoneBookSectionsDictFinal, phoneBookSectionsArrayFinal, phoneBookByShortPhonesFinal);
                                 updateUnregisteredContacts();
                                 getNotificationCenter().postNotificationName(NotificationCenter.contactsDidLoad);
@@ -1354,11 +1385,23 @@ public class ContactsController extends BaseController {
                     completedRequestsCount = 0;
                     final int count = (int) Math.ceil(toImport.size() / 500.0);
                     for (int a = 0; a < count; a++) {
+                        // Recheck at the actual upload boundary: consent can change while the
+                        // phonebook is read or while this work waits on a background queue.
+                        if (!isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) {
+                            return;
+                        }
                         final TLRPC.TL_contacts_importContacts req = new TLRPC.TL_contacts_importContacts();
                         int start = a * 500;
                         int end = Math.min(start + 500, toImport.size());
                         req.contacts = new ArrayList<>(toImport.subList(start, end));
-                        getConnectionsManager().sendRequest(req, (response, error) -> {
+                        // Queue first, then recheck consent immediately at the synchronous
+                        // Java/native request boundary. sendRequest() would enqueue again.
+                        Utilities.stageQueue.postRunnable(() -> getUserConfig().runIfContactSyncAllowed(
+                                sessionGeneration, consentGeneration,
+                                () -> getConnectionsManager().sendRequestSync(req, (response, error) -> {
+                            if (!isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) {
+                                return;
+                            }
                             completedRequestsCount++;
                             if (error == null) {
                                 if (BuildVars.LOGS_ENABLED) {
@@ -1411,6 +1454,7 @@ public class ContactsController extends BaseController {
                                     getMessagesStorage().putCachedPhoneBook(contactsMapToSave, false, false);
                                 }
                                 Utilities.stageQueue.postRunnable(() -> {
+                                    if (!isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) return;
                                     contactsBookSPhones = contactsBookShort;
                                     contactsBook = contactsMap;
                                     contactsSyncInProgress = false;
@@ -1423,18 +1467,26 @@ public class ContactsController extends BaseController {
                                         delayedContactsUpdate.clear();
                                     }
                                     AndroidUtilities.runOnUIThread(() -> {
+                                        if (!isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) return;
                                         mergePhonebookAndTelegramContacts(phoneBookSectionsDictFinal, phoneBookSectionsArrayFinal, phoneBookByShortPhonesFinal);
                                         getNotificationCenter().postNotificationName(NotificationCenter.contactsImported);
                                     });
                                     if (hasErrors[0]) {
-                                        Utilities.globalQueue.postRunnable(() -> getMessagesStorage().getCachedPhoneBook(true), 60000 * 5);
+                                        Utilities.globalQueue.postRunnable(() -> {
+                                            if (isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) {
+                                                getMessagesStorage().getCachedPhoneBook(true);
+                                            }
+                                        }, 60000 * 5);
                                     }
                                 });
                             }
-                        }, ConnectionsManager.RequestFlagFailOnServerErrors | ConnectionsManager.RequestFlagCanCompress);
+                        }, null, null,
+                                ConnectionsManager.RequestFlagFailOnServerErrors | ConnectionsManager.RequestFlagCanCompress,
+                                ConnectionsManager.DEFAULT_DATACENTER_ID, ConnectionsManager.ConnectionTypeGeneric, true)));
                     }
                 } else {
                     Utilities.stageQueue.postRunnable(() -> {
+                        if (!isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) return;
                         contactsBookSPhones = contactsBookShort;
                         contactsBook = contactsMap;
                         contactsSyncInProgress = false;
@@ -1447,6 +1499,7 @@ public class ContactsController extends BaseController {
                             delayedContactsUpdate.clear();
                         }
                         AndroidUtilities.runOnUIThread(() -> {
+                            if (!isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) return;
                             mergePhonebookAndTelegramContacts(phoneBookSectionsDictFinal, phoneBookSectionsArrayFinal, phoneBookByShortPhonesFinal);
                             updateUnregisteredContacts();
                             getNotificationCenter().postNotificationName(NotificationCenter.contactsDidLoad);
@@ -1456,6 +1509,7 @@ public class ContactsController extends BaseController {
                 }
             } else {
                 Utilities.stageQueue.postRunnable(() -> {
+                    if (!isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) return;
                     contactsBookSPhones = contactsBookShort;
                     contactsBook = contactsMap;
                     contactsSyncInProgress = false;
@@ -1467,9 +1521,13 @@ public class ContactsController extends BaseController {
                         applyContactsUpdates(delayedContactsUpdate, null, null, null);
                         delayedContactsUpdate.clear();
                     }
-                    AndroidUtilities.runOnUIThread(() -> mergePhonebookAndTelegramContacts(phoneBookSectionsDictFinal, phoneBookSectionsArrayFinal, phoneBookByShortPhonesFinal));
+                    AndroidUtilities.runOnUIThread(() -> {
+                        if (isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) {
+                            mergePhonebookAndTelegramContacts(phoneBookSectionsDictFinal, phoneBookSectionsArrayFinal, phoneBookByShortPhonesFinal);
+                        }
+                    });
                 });
-                if (!contactsMap.isEmpty()) {
+                if (isCurrentPhoneBookSync(sessionGeneration, consentGeneration) && !contactsMap.isEmpty()) {
                     getMessagesStorage().putCachedPhoneBook(contactsMap, false, false);
                 }
             }
@@ -2016,6 +2074,9 @@ public class ContactsController extends BaseController {
     }
 
     private void performWriteContactsToPhoneBookInternal(ArrayList<TLRPC.TL_contact> contactsArray) {
+        if (!getUserConfig().isContactSyncAllowed()) {
+            return;
+        }
         Cursor cursor = null;
         long time = System.currentTimeMillis();
         try {
@@ -2072,8 +2133,14 @@ public class ContactsController extends BaseController {
     }
 
     private void performWriteContactsToPhoneBook() {
+        final long sessionGeneration = getUserConfig().getSessionGeneration();
+        final long consentGeneration = getUserConfig().getContactSyncGeneration();
         final ArrayList<TLRPC.TL_contact> contactsArray = new ArrayList<>(contacts);
-        Utilities.phoneBookQueue.postRunnable(() -> performWriteContactsToPhoneBookInternal(contactsArray));
+        Utilities.phoneBookQueue.postRunnable(() -> {
+            if (isCurrentPhoneBookSync(sessionGeneration, consentGeneration)) {
+                performWriteContactsToPhoneBookInternal(contactsArray);
+            }
+        });
     }
 
     private void applyContactsUpdates(ArrayList<Long> ids, ConcurrentHashMap<Long, TLRPC.User> userDict, ArrayList<TLRPC.TL_contact> newC, ArrayList<Long> contactsTD) {

@@ -335,7 +335,10 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
     private boolean checkPermissions = true;
     private boolean checkShowPermissions = true;
     private boolean newAccount;
-    private boolean syncContacts = true;
+    private boolean syncContacts;
+    private boolean syncContactsExplicit;
+    private String authorizationContainerId;
+    private long authorizationGeneration;
     private boolean testBackend = false;
 
     @ActivityMode
@@ -467,7 +470,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
 
     public LoginActivity() {
         super();
-        AgramContainerManager.getInstance().ensureContainer(currentAccount);
+        bindAuthorizationContainer();
         ConnectionsManager.getInstance(currentAccount).applyAgramSessionProfile();
     }
 
@@ -475,7 +478,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
         super();
         currentAccount = account;
         newAccount = true;
-        AgramContainerManager.getInstance().ensureContainer(currentAccount);
+        bindAuthorizationContainer();
         ConnectionsManager.getInstance(currentAccount).applyAgramSessionProfile();
     }
 
@@ -484,6 +487,11 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
         currentViewNum = VIEW_ADD_EMAIL;
         emailChangeFinishCallback = onFinishCallback;
         return this;
+    }
+
+    private void bindAuthorizationContainer() {
+        authorizationContainerId = AgramContainerManager.getInstance().ensureContainer(currentAccount).id;
+        authorizationGeneration = UserConfig.getInstance(currentAccount).getSessionGeneration();
     }
 
     public LoginActivity changeEmail(Runnable onFinishCallback, Runnable onSkipCallback, boolean isNonSkippable) {
@@ -706,7 +714,8 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
         }
         if (savedInstanceState != null) {
             currentViewNum = savedInstanceState.getInt("currentViewNum", 0);
-            syncContacts = savedInstanceState.getInt("syncContacts", 1) == 1;
+            syncContactsExplicit = savedInstanceState.getInt("syncContactsExplicit", 0) == 1;
+            syncContacts = syncContactsExplicit && savedInstanceState.getInt("syncContacts", 0) == 1;
             if (currentViewNum >= VIEW_CODE_MESSAGE && currentViewNum <= VIEW_CODE_CALL) {
                 int time = savedInstanceState.getInt("open");
                 if (time != 0 && Math.abs(System.currentTimeMillis() / 1000 - time) >= 24 * 60 * 60) {
@@ -1586,6 +1595,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
             Bundle bundle = new Bundle();
             bundle.putInt("currentViewNum", currentViewNum);
             bundle.putInt("syncContacts", syncContacts ? 1 : 0);
+            bundle.putInt("syncContactsExplicit", syncContactsExplicit ? 1 : 0);
             for (int a = 0; a <= currentViewNum; a++) {
                 SlideView v = views[a];
                 if (v != null) {
@@ -1656,14 +1666,43 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
     private boolean pendingSwitchingAccount;
 
     private void onAuthSuccess(TLRPC.TL_auth_authorization res, boolean afterSignup) {
+        UserConfig userConfig = UserConfig.getInstance(currentAccount);
+        AgramContainerManager manager = AgramContainerManager.getInstance();
+        boolean installed = false;
+        try {
+            if (manager.isCurrentContainer(currentAccount, authorizationContainerId)
+                    && manager.isContainerAccessible(currentAccount)
+                    && userConfig.isSessionGenerationCurrent(authorizationGeneration)
+                    && ConnectionsManager.isAgramAuthTransportReady(currentAccount)
+                    && !userConfig.isClientActivated() && !userConfig.hasPersistedSession()) {
+                installed = userConfig.installAuthorizedUser(res.user,
+                        syncContactsExplicit && syncContacts, authorizationGeneration);
+                if (installed) {
+                    // The user is durable already. Failure to persist a profile lock must not
+                    // erase that session or strand an otherwise empty slot behind a lock.
+                    manager.markAuthorized(currentAccount, authorizationContainerId);
+                }
+            }
+        } catch (AgramContainerManager.ContainerPersistenceException e) {
+            FileLog.e("Unable to persist authorization container", e);
+            NotificationCenter.getInstance(currentAccount).postNotificationName(
+                    NotificationCenter.agramContainerPersistenceFailed, currentAccount, "login_profile_lock");
+        }
+        if (!installed) {
+            FileLog.e("Unable to durably prepare account slot " + currentAccount + " after authorization");
+            NotificationCenter.getInstance(currentAccount).postNotificationName(
+                    NotificationCenter.agramContainerPersistenceFailed,
+                    currentAccount,
+                    "login_slot_reset");
+            needShowAlert(
+                    getString(R.string.AppName),
+                    "Не удалось безопасно сохранить вход. Освободите место и перезапустите приложение. Предыдущие локальные данные не удалены.");
+            return;
+        }
         MessagesController.getInstance(currentAccount).cleanup();
         ConnectionsManager.getInstance(currentAccount).setUserId(res.user.id);
-        UserConfig.getInstance(currentAccount).clearConfig();
         MessagesController.getInstance(currentAccount).cleanup();
-        UserConfig.getInstance(currentAccount).syncContacts = syncContacts;
-        UserConfig.getInstance(currentAccount).setCurrentUser(res.user);
-        UserConfig.getInstance(currentAccount).saveConfig(true);
-        AgramContainerManager.getInstance().markAuthorized(currentAccount);
+        userConfig.saveConfig(true);
         AgramPushController.getInstance().onAccountAuthorized(currentAccount);
         MessagesStorage.getInstance(currentAccount).cleanup(true);
         ArrayList<TLRPC.User> users = new ArrayList<>();
@@ -2463,7 +2502,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
             });
 
             int bottomMargin = 72;
-            if (newAccount && activityMode == MODE_LOGIN) {
+            if (activityMode == MODE_LOGIN) {
                 syncContactsBox = new CheckBoxCell(context, 2);
                 syncContactsBox.setText(getString("SyncContacts", R.string.SyncContacts), "", syncContacts, false);
                 addView(syncContactsBox, LayoutHelper.createLinear(LayoutHelper.WRAP_CONTENT, LayoutHelper.MATCH_PARENT, Gravity.LEFT | Gravity.TOP, 16, 0, 16 + (LocaleController.isRTL && AndroidUtilities.isSmallScreen() ? 56 : 0), 0));
@@ -2473,6 +2512,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
                         return;
                     }
                     CheckBoxCell cell = (CheckBoxCell) v;
+                    syncContactsExplicit = true;
                     syncContacts = !syncContacts;
                     cell.setChecked(syncContacts, true);
                     if (syncContacts) {
@@ -3087,7 +3127,8 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
             TLRPC.TL_codeSettings settings = new TLRPC.TL_codeSettings();
             settings.allow_flashcall = simcardAvailable && allowCall && allowCancelCall && allowReadCallLog;
             settings.allow_missed_call = simcardAvailable && allowCall;
-            settings.allow_app_hash = settings.allow_firebase = PushListenerController.GooglePushListenerServiceProvider.INSTANCE.hasServices();
+            settings.allow_app_hash = PushListenerController.GooglePushListenerServiceProvider.INSTANCE.hasServices();
+            settings.allow_firebase = false;
             if (forceDisableSafetyNet || TextUtils.isEmpty(BuildVars.SAFETYNET_KEY)) {
                 settings.allow_firebase = false;
             }
@@ -3743,7 +3784,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
                 innerLinearLayout.addView(frameLayout, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL));
 
                 blueImageView = new RLottieImageView(context);
-                hintDrawable = new RLottieDrawable(R.raw.phone_flash_call, String.valueOf(R.raw.phone_flash_call), AndroidUtilities.dp(64), AndroidUtilities.dp(64), true, null);
+                hintDrawable = new RLottieDrawable(R.raw.phone_flash_call, AndroidUtilities.dp(64), AndroidUtilities.dp(64), true, null);
                 blueImageView.setAnimation(hintDrawable);
                 frameLayout.addView(blueImageView, LayoutHelper.createFrame(64, 64));
 
@@ -3758,13 +3799,13 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
 
                 int size = currentType == AUTH_TYPE_MESSAGE ? 128 : 64;
                 if (currentType == AUTH_TYPE_MESSAGE) {
-                    hintDrawable = new RLottieDrawable(R.raw.code_laptop, String.valueOf(R.raw.code_laptop), AndroidUtilities.dp(size), AndroidUtilities.dp(size), true, null);
+                    hintDrawable = new RLottieDrawable(R.raw.code_laptop, AndroidUtilities.dp(size), AndroidUtilities.dp(size), true, null);
                 } else {
-                    hintDrawable = new RLottieDrawable(R.raw.sms_incoming_info, String.valueOf(R.raw.sms_incoming_info), AndroidUtilities.dp(size), AndroidUtilities.dp(size), true, null);
+                    hintDrawable = new RLottieDrawable(R.raw.sms_incoming_info, AndroidUtilities.dp(size), AndroidUtilities.dp(size), true, null);
 
-                    starsToDotsDrawable = new RLottieDrawable(R.raw.phone_stars_to_dots, String.valueOf(R.raw.phone_stars_to_dots), AndroidUtilities.dp(size), AndroidUtilities.dp(size), true, null);
-                    dotsDrawable = new RLottieDrawable(R.raw.phone_dots, String.valueOf(R.raw.phone_dots), AndroidUtilities.dp(size), AndroidUtilities.dp(size), true, null);
-                    dotsToStarsDrawable = new RLottieDrawable(R.raw.phone_dots_to_stars, String.valueOf(R.raw.phone_dots_to_stars), AndroidUtilities.dp(size), AndroidUtilities.dp(size), true, null);
+                    starsToDotsDrawable = new RLottieDrawable(R.raw.phone_stars_to_dots, AndroidUtilities.dp(size), AndroidUtilities.dp(size), true, null);
+                    dotsDrawable = new RLottieDrawable(R.raw.phone_dots, AndroidUtilities.dp(size), AndroidUtilities.dp(size), true, null);
+                    dotsToStarsDrawable = new RLottieDrawable(R.raw.phone_dots_to_stars, AndroidUtilities.dp(size), AndroidUtilities.dp(size), true, null);
                 }
                 blueImageView = new RLottieImageView(context);
                 blueImageView.setAnimation(hintDrawable);
@@ -4753,10 +4794,16 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
                         nextPressed = false;
                         if (error == null) {
                             TLRPC.User user = (TLRPC.User) response;
+                            UserConfig config = UserConfig.getInstance(currentAccount);
+                            if (!config.isSessionGenerationCurrent(authorizationGeneration)
+                                    || !AgramContainerManager.getInstance().isCurrentContainer(currentAccount, authorizationContainerId)
+                                    || !config.isClientActivated() || config.getClientUserId() != user.id) {
+                                return;
+                            }
                             destroyTimer();
                             destroyCodeTimer();
-                            UserConfig.getInstance(currentAccount).setCurrentUser(user);
-                            UserConfig.getInstance(currentAccount).saveConfig(true);
+                            config.setCurrentUser(user);
+                            config.saveConfig(true);
                             ArrayList<TLRPC.User> users = new ArrayList<>();
                             users.add(user);
                             MessagesStorage.getInstance(currentAccount).putUsersAndChats(users, null, true, true);
@@ -5980,7 +6027,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
             signInWithGoogleView.setMaxLines(2);
 
             SpannableStringBuilder str = new SpannableStringBuilder("d ");
-            Drawable dr = ContextCompat.getDrawable(context, R.drawable.googleg_standard_color_18);
+            Drawable dr = ContextCompat.getDrawable(context, com.google.android.gms.base.R.drawable.googleg_standard_color_18);
             dr.setBounds(0, AndroidUtilities.dp(9), AndroidUtilities.dp(18), AndroidUtilities.dp(18 + 9));
             str.setSpan(new ImageSpan(dr, ImageSpan.ALIGN_BOTTOM), 0, 1, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
             str.setSpan(new ReplacementSpan() {
@@ -6326,7 +6373,7 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
             signInWithGoogleView.setMaxLines(2);
 
             SpannableStringBuilder str = new SpannableStringBuilder("d ");
-            Drawable dr = ContextCompat.getDrawable(context, R.drawable.googleg_standard_color_18);
+            Drawable dr = ContextCompat.getDrawable(context, com.google.android.gms.base.R.drawable.googleg_standard_color_18);
             dr.setBounds(0, AndroidUtilities.dp(9), AndroidUtilities.dp(18), AndroidUtilities.dp(18 + 9));
             str.setSpan(new ImageSpan(dr, ImageSpan.ALIGN_BOTTOM), 0, 1, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
             str.setSpan(new ReplacementSpan() {
@@ -7889,8 +7936,8 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
                 avatarEditor.playAnimation();
             });
 
-            cameraDrawable = new RLottieDrawable(R.raw.camera, String.valueOf(R.raw.camera), AndroidUtilities.dp(70), AndroidUtilities.dp(70), false, null);
-            cameraWaitDrawable = new RLottieDrawable(R.raw.camera_wait, String.valueOf(R.raw.camera_wait), AndroidUtilities.dp(70), AndroidUtilities.dp(70), false, null);
+            cameraDrawable = new RLottieDrawable(R.raw.camera, AndroidUtilities.dp(70), AndroidUtilities.dp(70), false, null);
+            cameraWaitDrawable = new RLottieDrawable(R.raw.camera_wait, AndroidUtilities.dp(70), AndroidUtilities.dp(70), false, null);
 
             avatarEditor = new RLottieImageView(context) {
                 @Override

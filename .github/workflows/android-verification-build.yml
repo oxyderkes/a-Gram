@@ -1,0 +1,69 @@
+name: Android unsigned verification build
+
+# Deliberate internal build. Fork PRs must never receive Telegram API credentials.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: overlay
+      - name: Require private production API configuration
+        shell: bash
+        run: |
+          test -n "$TELEGRAM_API_ID" && test -n "$TELEGRAM_API_HASH" || {
+            echo 'Configure TELEGRAM_API_ID and TELEGRAM_API_HASH repository secrets first.'
+            exit 1
+          }
+      - uses: actions/checkout@v4
+        with:
+          repository: DrKLO/Telegram
+          ref: dc780e81ed1261c369c27870e8e0999a1eb0b600
+          submodules: recursive
+          path: source
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - name: Install pinned Android toolchain
+        run: sdkmanager 'platforms;android-35' 'platforms;android-36' 'build-tools;35.0.0' 'build-tools;36.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
+      - name: Apply overlay and verify
+        shell: bash
+        run: |
+          cp -a overlay/android/. source/
+          python overlay/.github/scripts/verify_android_themes.py --source source
+          python overlay/.github/scripts/verify_android_overlay.py
+          python overlay/.github/scripts/run_android_regressions.py
+      - name: Compile arm64 APK without signing secrets
+        working-directory: source
+        shell: bash
+        # Upstream's unrelated application modules evaluate these properties even when not built.
+        # The Standalone signingConfig is explicitly null in this lane; these are not credentials.
+        run: bash gradlew :TMessagesProj_AppStandalone:assembleAfatStandalone -PAGRAM_UNSIGNED_BUILD=true -PRELEASE_STORE_PASSWORD=unsigned-unused -PRELEASE_KEY_PASSWORD=unsigned-unused -PRELEASE_KEY_ALIAS=unsigned-unused --no-daemon
+      - name: Verify packaged theme bytes
+        shell: bash
+        run: |
+          mapfile -t apks < <(find source/TMessagesProj_AppStandalone/build/outputs/apk/afat/standalone -maxdepth 1 -type f -name '*.apk' -print)
+          test "${#apks[@]}" -eq 1 || {
+            echo "Expected exactly one standalone APK, found ${#apks[@]}."
+            exit 1
+          }
+          python overlay/.github/scripts/verify_android_themes.py --source source --apk "${apks[0]}"
+          python overlay/.github/scripts/verify_android_manifest.py --manifest source/TMessagesProj_AppStandalone/build/intermediates/merged_manifests/afatStandalone/processAfatStandaloneManifest/AndroidManifest.xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agram-android-unsigned-verification
+          path: source/TMessagesProj_AppStandalone/build/outputs/apk/afat/standalone/*.apk
+          if-no-files-found: error
+          retention-days: 7

@@ -64,16 +64,19 @@ public final class AgramPushController {
     }
 
     public void onAccountAuthorized(int account) {
-        AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().ensureContainer(account);
-        if (AgramContainerManager.PUSH_AGRAM.equals(record.pushMode)) {
+        AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(account);
+        if (record != null && record.isStorageAccessible()
+                && UserConfig.getInstance(account).isClientActivated()
+                && AgramContainerManager.PUSH_AGRAM.equals(record.pushMode)) {
             requestServiceStart();
             refreshSubscriptions();
         }
     }
 
     public void onPushSettingsChanged(int account) {
-        AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().ensureContainer(account);
-        if (AgramContainerManager.PUSH_AGRAM.equals(record.pushMode)
+        AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(account);
+        if (record != null && record.isStorageAccessible()
+                && AgramContainerManager.PUSH_AGRAM.equals(record.pushMode)
                 && UserConfig.getInstance(account).isClientActivated()) {
             requestServiceStart();
         }
@@ -90,20 +93,38 @@ public final class AgramPushController {
 
     public void unregisterAccount(int account, boolean notifyTelegram) {
         AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(account);
-        if (record == null) {
-            return;
-        }
+        unregisterAccount(account, record == null ? null : record.id, notifyTelegram);
+    }
+
+    public void unregisterAccount(int account, String expectedContainerId, boolean notifyTelegram) {
+        AgramContainerManager manager = AgramContainerManager.getInstance();
         synchronized (sync) {
-            stopSubscriptionLocked(account);
+            Subscription subscription = subscriptions.get(account);
+            if (subscription != null && subscription.containerId.equals(expectedContainerId)) {
+                stopSubscriptionLocked(account);
+            }
         }
-        if (notifyTelegram && !TextUtils.isEmpty(record.agramPushEndpoint)) {
-            MessagesController.getInstance(account).unregisterAgramPush(record.agramPushEndpoint);
+        AgramPushState.clear(account, expectedContainerId);
+        AgramContainerManager.ContainerRecord record = manager.getContainer(account);
+        if (record != null && record.id.equals(expectedContainerId)) {
+            try {
+                manager.runBoundSettingsUpdate(account, expectedContainerId, () -> {
+                    // A durable logout has already retired UserConfig. A server
+                    // logout revokes its endpoint; never initialize a new slot.
+                    if (notifyTelegram && UserConfig.getInstance(account).isClientActivated()
+                            && !TextUtils.isEmpty(record.agramPushEndpoint)) {
+                        MessagesController.getInstance(account).unregisterAgramPush(record.agramPushEndpoint);
+                    }
+                    manager.saveAgramPushEndpoint(account, "", "unregistered");
+                });
+            } catch (RuntimeException error) {
+                // Stopping the socket and continuing logout must not depend on
+                // a metadata write succeeding on a full/unavailable disk.
+                FileLog.e("Agram Push stopped; endpoint cleanup could not be persisted");
+            }
         }
-        AgramContainerManager.getInstance().saveAgramPushEndpoint(account, "", "unregistered");
         AgramPushService.updateForegroundNotification(subscriptionCount());
-        // Logout clears UserConfig asynchronously. Re-evaluate after it has
-        // completed, without recreating an endpoint in the departing slot.
-        AndroidUtilities.runOnUIThread(this::restoreActiveRegistrations, 1_500L);
+        AndroidUtilities.runOnUIThread(this::restoreActiveRegistrations);
     }
 
     void onServiceStarted() {
@@ -132,13 +153,31 @@ public final class AgramPushController {
             for (int account = 0; account < UserConfig.MAX_ACCOUNT_COUNT; account++) {
                 AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(account);
                 if (record == null
+                        || !record.isStorageAccessible()
                         || !UserConfig.getInstance(account).isClientActivated()
                         || !AgramContainerManager.PUSH_AGRAM.equals(record.pushMode)) {
                     continue;
                 }
                 requiredAccounts.add(account);
-                String endpoint = ensureEmbeddedEndpoint(account, record);
-                AgramContainerManager.ContainerRecord current = AgramContainerManager.getInstance().ensureContainer(account);
+                String endpoint;
+                try {
+                    endpoint = ensureEmbeddedEndpoint(account, record);
+                } catch (RuntimeException error) {
+                    stopSubscriptionLocked(account);
+                    AgramPushState.Binding failed = AgramPushState.bind(account, record.id, "");
+                    long revision = AgramPushState.beginStream(failed);
+                    AgramPushState.stream(failed, revision, "configuration_error",
+                            "Не удалось подготовить Push. Проверьте настройки и свободное место.");
+                    continue;
+                }
+                AgramContainerManager.ContainerRecord current = AgramContainerManager.getInstance().getContainer(account);
+                if (current == null || !current.isStorageAccessible()
+                        || !record.id.equals(current.id) || !endpoint.equals(current.agramPushEndpoint)
+                        || !AgramContainerManager.PUSH_AGRAM.equals(current.pushMode)
+                        || !UserConfig.getInstance(account).isClientActivated()) {
+                    stopSubscriptionLocked(account);
+                    continue;
+                }
                 Subscription existing = subscriptions.get(account);
                 if (existing == null || !existing.matches(current.id, endpoint)) {
                     stopSubscriptionLocked(account);
@@ -146,7 +185,8 @@ public final class AgramPushController {
                     subscriptions.put(account, subscription);
                     subscription.start();
                 }
-                registerEndpointWithTelegram(account, endpoint);
+                registerEndpointWithTelegram(account, current.id, endpoint,
+                        UserConfig.getInstance(account).getSessionGeneration());
             }
             for (int index = subscriptions.size() - 1; index >= 0; index--) {
                 int account = subscriptions.keyAt(index);
@@ -173,25 +213,36 @@ public final class AgramPushController {
         String topic = TOPIC_PREFIX + Base64.encodeToString(
                 random, Base64.NO_WRAP | Base64.NO_PADDING | Base64.URL_SAFE);
         String endpoint = baseUrl + "/" + topic;
-        AgramContainerManager.getInstance().saveAgramPushEndpoint(account, endpoint, "starting");
-        if (UserConfig.getInstance(account).isClientActivated() && !TextUtils.isEmpty(legacyEndpoint)) {
-            MessagesController.getInstance(account).unregisterAgramPush(legacyEndpoint);
-        }
+        AgramContainerManager manager = AgramContainerManager.getInstance();
+        manager.runBoundSettingsUpdate(account, record.id, () -> {
+            if (!UserConfig.getInstance(account).isClientActivated()) {
+                throw new IllegalStateException("Agram Push session was retired");
+            }
+            manager.saveAgramPushEndpoint(account, endpoint, "starting");
+            if (!TextUtils.isEmpty(legacyEndpoint)) {
+                MessagesController.getInstance(account).unregisterAgramPush(legacyEndpoint);
+            }
+        });
         return endpoint;
     }
 
-    private void registerEndpointWithTelegram(int account, String endpoint) {
-        if (UserConfig.getInstance(account).isClientActivated() && !TextUtils.isEmpty(endpoint)) {
+    private void registerEndpointWithTelegram(int account, String containerId, String endpoint, long sessionGeneration) {
+        AgramContainerManager.ContainerRecord current = AgramContainerManager.getInstance().getContainer(account);
+        if (current != null && current.isStorageAccessible() && containerId.equals(current.id)
+                && UserConfig.getInstance(account).isSessionGenerationCurrent(sessionGeneration)
+                && UserConfig.getInstance(account).isClientActivated() && !TextUtils.isEmpty(endpoint)) {
             MessagesController.getInstance(account).registerAgramPush(endpoint);
         }
     }
 
-    private void onMessage(int account, String containerId, String endpoint) {
+    private void onMessage(int account, String containerId, String endpoint, long sessionGeneration) {
         AgramContainerManager.ContainerRecord current = AgramContainerManager.getInstance().getContainer(account);
         if (current == null
+                || !current.isStorageAccessible()
                 || !containerId.equals(current.id)
                 || !endpoint.equals(current.agramPushEndpoint)
                 || !AgramContainerManager.PUSH_AGRAM.equals(current.pushMode)
+                || !UserConfig.getInstance(account).isSessionGenerationCurrent(sessionGeneration)
                 || !UserConfig.getInstance(account).isClientActivated()) {
             return;
         }
@@ -218,6 +269,7 @@ public final class AgramPushController {
         for (int account = 0; account < UserConfig.MAX_ACCOUNT_COUNT; account++) {
             AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(account);
             if (record != null
+                    && record.isStorageAccessible()
                     && UserConfig.getInstance(account).isClientActivated()
                     && AgramContainerManager.PUSH_AGRAM.equals(record.pushMode)) {
                 return true;
@@ -247,13 +299,28 @@ public final class AgramPushController {
     private static String pushBaseUrl() {
         String configured = BuildConfig.AGRAM_PUSH_BASE_URL == null
                 ? "" : BuildConfig.AGRAM_PUSH_BASE_URL.trim();
-        if (!configured.startsWith("https://")) {
-            configured = "https://ntfy.sh";
-        }
         while (configured.endsWith("/")) {
             configured = configured.substring(0, configured.length() - 1);
         }
+        try {
+            URL url = new URL(configured);
+            if (!"https".equals(url.getProtocol()) || TextUtils.isEmpty(url.getHost())
+                    || url.getUserInfo() != null || url.getQuery() != null || url.getRef() != null) {
+                throw new IllegalArgumentException("Invalid HTTPS push relay configuration");
+            }
+        } catch (java.net.MalformedURLException error) {
+            throw new IllegalArgumentException("Invalid HTTPS push relay configuration", error);
+        }
         return configured;
+    }
+
+    /** Relay host only; never expose the capability URL/topic in UI or logs. */
+    public String relayHost() {
+        try {
+            return new URL(pushBaseUrl()).getHost();
+        } catch (Exception error) {
+            return "не настроен";
+        }
     }
 
     private static boolean isEmbeddedEndpoint(String endpoint, String baseUrl) {
@@ -265,6 +332,9 @@ public final class AgramPushController {
         private final String containerId;
         private final String endpoint;
         private final String topic;
+        private final long sessionGeneration;
+        private final AgramPushState.Binding statusBinding;
+        private long statusRevision;
         private volatile boolean stopped;
         private volatile HttpsURLConnection connection;
         private Thread thread;
@@ -275,13 +345,17 @@ public final class AgramPushController {
             this.containerId = containerId;
             this.endpoint = endpoint;
             this.topic = endpoint.substring(endpoint.lastIndexOf('/') + 1);
+            sessionGeneration = UserConfig.getInstance(account).getSessionGeneration();
+            statusBinding = AgramPushState.bind(account, containerId, endpoint);
         }
 
         boolean matches(String expectedContainerId, String expectedEndpoint) {
-            return containerId.equals(expectedContainerId) && endpoint.equals(expectedEndpoint);
+            return !stopped && containerId.equals(expectedContainerId) && endpoint.equals(expectedEndpoint)
+                    && UserConfig.getInstance(account).isSessionGenerationCurrent(sessionGeneration);
         }
 
         void start() {
+            statusRevision = AgramPushState.beginStream(statusBinding);
             thread = new Thread(this, "AgramPush-" + account);
             thread.setDaemon(true);
             thread.start();
@@ -289,13 +363,22 @@ public final class AgramPushController {
 
         void stop() {
             stopped = true;
+            AgramPushState.stopStream(statusBinding, statusRevision);
             HttpsURLConnection activeConnection = connection;
             if (activeConnection != null) {
-                activeConnection.disconnect();
+                try {
+                    activeConnection.disconnect();
+                } catch (RuntimeException error) {
+                    FileLog.e("Agram Push socket disconnect failed");
+                }
             }
             Thread activeThread = thread;
             if (activeThread != null) {
-                activeThread.interrupt();
+                try {
+                    activeThread.interrupt();
+                } catch (RuntimeException error) {
+                    FileLog.e("Agram Push worker interrupt failed");
+                }
             }
         }
 
@@ -304,13 +387,15 @@ public final class AgramPushController {
             long reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
             while (!stopped && isCurrentBinding()) {
                 try {
+                    AgramPushState.stream(statusBinding, statusRevision, "connecting", "");
                     readStream();
                     reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
                 } catch (Throwable error) {
                     if (!stopped) {
-                        FileLog.e("Agram Push connection failed for account " + account, error);
-                        AgramContainerManager.getInstance().saveAgramPushEndpoint(
-                                account, endpoint, "reconnecting");
+                        // Exception messages may include the endpoint capability or proxy credentials.
+                        FileLog.e("Agram Push connection failed: " + error.getClass().getSimpleName());
+                        AgramPushState.stream(statusBinding, statusRevision, "reconnecting",
+                                safeConnectionError(error));
                     }
                 } finally {
                     HttpsURLConnection activeConnection = connection;
@@ -321,9 +406,10 @@ public final class AgramPushController {
                 }
                 if (!stopped) {
                     try {
-                        Thread.sleep(reconnectDelay);
+                        Thread.sleep(reconnectDelay + secureRandom.nextInt(1000));
                     } catch (InterruptedException ignore) {
                         Thread.currentThread().interrupt();
+                        break;
                     }
                     reconnectDelay = Math.min(MAX_RECONNECT_DELAY_MS, reconnectDelay * 2L);
                 }
@@ -332,7 +418,7 @@ public final class AgramPushController {
 
         private void readStream() throws Exception {
             AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(account);
-            if (record == null) {
+            if (record == null || !isCurrentBinding()) {
                 return;
             }
             String cursor = TextUtils.isEmpty(lastMessageId) ? "10m" : lastMessageId;
@@ -345,7 +431,9 @@ public final class AgramPushController {
             HttpsURLConnection https = (HttpsURLConnection) raw;
             connection = https;
             https.setConnectTimeout(20_000);
-            https.setReadTimeout(0);
+            // A half-open socket must not keep an account falsely 'connected' forever.
+            https.setReadTimeout(90_000);
+            https.setInstanceFollowRedirects(false);
             https.setUseCaches(false);
             https.setRequestProperty("Accept", "application/x-ndjson");
             https.setRequestProperty("User-Agent", "AgramPush/" + BuildVars.BUILD_VERSION_STRING);
@@ -369,14 +457,33 @@ public final class AgramPushController {
             if (status < 200 || status >= 300) {
                 throw new IOException("Push server returned HTTP " + status);
             }
-            AgramContainerManager.getInstance().saveAgramPushEndpoint(account, endpoint, "connected");
+            if (stopped || !isCurrentBinding()) return;
+            AgramPushState.stream(statusBinding, statusRevision, "connected", "");
+            AndroidUtilities.runOnUIThread(() -> {
+                if (!stopped && isCurrentBinding()) {
+                    registerEndpointWithTelegram(account, containerId, endpoint, sessionGeneration);
+                }
+            });
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(
                     https.getInputStream(), StandardCharsets.UTF_8))) {
                 String line;
-                while (!stopped && (line = reader.readLine()) != null) {
+                while (!stopped && (line = readBoundedLine(reader)) != null) {
                     handleLine(line);
                 }
+                if (!stopped) throw new IOException("Push stream closed");
             }
+        }
+
+        // The relay is external input. Never allocate an unbounded line on a subscription thread.
+        private String readBoundedLine(BufferedReader reader) throws IOException {
+            StringBuilder value = new StringBuilder(256);
+            for (int next; (next = reader.read()) != -1;) {
+                if (stopped) return null;
+                if (next == '\n') return value.toString();
+                if (value.length() >= 64 * 1024) throw new IOException("Push event exceeds size limit");
+                if (next != '\r') value.append((char) next);
+            }
+            return value.length() == 0 ? null : value.toString();
         }
 
         private RoutedConnection openConnection(URL url, AgramContainerManager.ContainerRecord record) throws IOException {
@@ -413,20 +520,34 @@ public final class AgramPushController {
                     return;
                 }
                 lastMessageId = messageId;
-                onMessage(account, containerId, endpoint);
+                AndroidUtilities.runOnUIThread(() -> {
+                    if (!stopped && isCurrentBinding()) {
+                        onMessage(account, containerId, endpoint, sessionGeneration);
+                    }
+                });
             } catch (Throwable error) {
-                FileLog.e("Unable to parse Agram Push event for account " + account, error);
+                FileLog.e("Unable to parse Agram Push event: " + error.getClass().getSimpleName());
             }
         }
 
         private boolean isCurrentBinding() {
             AgramContainerManager.ContainerRecord current = AgramContainerManager.getInstance().getContainer(account);
             return current != null
+                    && !stopped
+                    && current.isStorageAccessible()
                     && containerId.equals(current.id)
                     && endpoint.equals(current.agramPushEndpoint)
                     && AgramContainerManager.PUSH_AGRAM.equals(current.pushMode)
+                    && UserConfig.getInstance(account).isSessionGenerationCurrent(sessionGeneration)
                     && UserConfig.getInstance(account).isClientActivated();
         }
+    }
+
+    private static String safeConnectionError(Throwable error) {
+        if (error instanceof java.net.SocketTimeoutException) return "Истекло время ожидания Push";
+        if (error instanceof java.net.UnknownHostException) return "Не удалось найти сервер Push";
+        if (error instanceof javax.net.ssl.SSLException) return "Ошибка защищённого соединения Push";
+        return "Канал Push недоступен. Проверьте сеть и совместимость прокси с HTTPS.";
     }
 
     private static final class RoutedConnection {

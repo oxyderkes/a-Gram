@@ -38,7 +38,16 @@ public final class AgramSecureStore {
     }
 
     public static byte[] encrypt(String scope, byte[] cleartext, byte[] associatedData) throws GeneralSecurityException {
-        SecretKey key = getOrCreateKey(scope);
+        return encrypt(scope, cleartext, associatedData, true);
+    }
+
+    /** Existing ciphertext must never be rewritten under a replacement Keystore key. */
+    public static byte[] encryptExisting(String scope, byte[] cleartext, byte[] associatedData) throws GeneralSecurityException {
+        return encrypt(scope, cleartext, associatedData, false);
+    }
+
+    private static byte[] encrypt(String scope, byte[] cleartext, byte[] associatedData, boolean allowCreate) throws GeneralSecurityException {
+        SecretKey key = allowCreate ? getOrCreateKey(scope) : getExistingKey(scope);
         Cipher cipher = Cipher.getInstance(CIPHER);
         cipher.init(Cipher.ENCRYPT_MODE, key);
         if (associatedData != null) {

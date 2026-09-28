@@ -67,6 +67,8 @@ public final class AgramContainerManager {
     private static final String PUSH_INSTANCE_HASH_PREFIX = "push_instance_hash_";
     private static final String QUARANTINE_PREFIX = "quarantine_";
     private static final String DELETION_INTENT_PREFIX = "deletion_intent_";
+    private static final String NATIVE_RETIREMENT_PREFIX = "native_retirement_";
+    private static final String NATIVE_RETIRED_PREFIX = "native_retired_";
     private static final int SCHEMA_VERSION = 7;
     private static final String LEGACY_DURESS_PREFS = "agram_duress_registry";
     private static final String LEGACY_DURESS_SCOPE = "agram_global_duress_v1";
@@ -116,7 +118,7 @@ public final class AgramContainerManager {
         synchronized (sync) {
             ContainerRecord cached = recordCache.get(account);
             if (cached != null) {
-                return cached;
+                return copyRecord(cached);
             }
             String id = preferences.getString(SLOT_PREFIX + account, null);
             if (!TextUtils.isEmpty(id)) {
@@ -124,13 +126,13 @@ public final class AgramContainerManager {
                 if (record.isStorageAccessible()) {
                     ensureUniquePushInstanceLocked(record);
                 }
-                recordCache.put(account, record);
-                return record;
+                recordCache.put(account, copyRecord(record));
+                return copyRecord(record);
             }
             ContainerRecord record = createDefault(account);
             ensureUniquePushInstanceLocked(record);
             saveRecord(record);
-            return record;
+            return copyRecord(record);
         }
     }
 
@@ -138,7 +140,7 @@ public final class AgramContainerManager {
         synchronized (sync) {
             ContainerRecord cached = recordCache.get(account);
             if (cached != null) {
-                return cached;
+                return copyRecord(cached);
             }
             String id = preferences.getString(SLOT_PREFIX + account, null);
             ContainerRecord record = TextUtils.isEmpty(id) ? null : readRecord(account, id);
@@ -146,9 +148,9 @@ public final class AgramContainerManager {
                 if (record.isStorageAccessible()) {
                     ensureUniquePushInstanceLocked(record);
                 }
-                recordCache.put(account, record);
+                recordCache.put(account, copyRecord(record));
             }
-            return record;
+            return copyRecord(record);
         }
     }
 
@@ -163,6 +165,91 @@ public final class AgramContainerManager {
     public boolean isContainerAccessible(int account) {
         ContainerRecord record = getContainer(account);
         return record != null && record.isStorageAccessible();
+    }
+
+    public boolean isCurrentContainer(int account, String expectedId) {
+        synchronized (sync) {
+            return !TextUtils.isEmpty(expectedId)
+                    && TextUtils.equals(expectedId, preferences.getString(SLOT_PREFIX + account, null))
+                    && !preferences.getBoolean(DELETION_INTENT_PREFIX + expectedId, false);
+        }
+    }
+
+    public boolean canUseForNewLogin(int account) {
+        synchronized (sync) {
+            ContainerRecord record = getContainer(account);
+            return record == null || (record.isStorageAccessible() && !record.profileLocked
+                    && !preferences.getBoolean(DELETION_INTENT_PREFIX + record.id, false)
+                    && !preferences.getBoolean(NATIVE_RETIREMENT_PREFIX + record.id, false));
+        }
+    }
+
+    /** Explicit durable logout intent, never inferred from an inactive runtime slot. */
+    public boolean prepareNativeRetirement(int account, String expectedId) {
+        synchronized (sync) {
+            ContainerRecord record = getContainer(account);
+            return record != null && record.isStorageAccessible()
+                    && TextUtils.equals(record.id, expectedId)
+                    && AgramPreferenceTransaction.commit(preferences, preferences.edit()
+                    .putBoolean(NATIVE_RETIREMENT_PREFIX + expectedId, true),
+                    NATIVE_RETIREMENT_PREFIX + expectedId);
+        }
+    }
+
+    public boolean hasPendingNativeRetirement(int account, String expectedId) {
+        synchronized (sync) {
+            return !TextUtils.isEmpty(expectedId)
+                    && TextUtils.equals(expectedId, preferences.getString(SLOT_PREFIX + account, null))
+                    && preferences.getBoolean(NATIVE_RETIREMENT_PREFIX + expectedId, false);
+        }
+    }
+
+    /** Call only after native confirms its durable old-UUID -> empty transition. */
+    public boolean acknowledgeNativeRetirement(int account, String expectedId) {
+        synchronized (sync) {
+            return hasPendingNativeRetirement(account, expectedId) && !hasPersistedUser(account)
+                    && AgramPreferenceTransaction.commit(preferences, preferences.edit()
+                    .putBoolean(NATIVE_RETIRED_PREFIX + expectedId, true),
+                    NATIVE_RETIRED_PREFIX + expectedId);
+        }
+    }
+
+    private static boolean hasPersistedUser(int account) {
+        // No UserConfig construction during the registry's startup sweep.
+        return ApplicationLoader.applicationContext.getSharedPreferences(
+                account == 0 ? "userconfing" : "userconfig" + account, Context.MODE_PRIVATE).contains("user");
+    }
+
+    private boolean canDeleteRetiredContainer(String id) {
+        for (int account = 0; account < UserConfig.MAX_ACCOUNT_COUNT; account++) {
+            if (TextUtils.equals(id, preferences.getString(SLOT_PREFIX + account, null))) {
+                return !hasPersistedUser(account)
+                        && preferences.getBoolean(NATIVE_RETIRED_PREFIX + id, false);
+            }
+        }
+        return true; // An already-unmapped tombstone cannot own a live slot.
+    }
+
+    /**
+     * Runs a bounded group of settings writes only while the slot still owns
+     * the container that the UI originally displayed. Nested manager mutators
+     * are safe because Java monitors are re-entrant. Individual mutators remain
+     * separately durable, so callers must report a possible partial update if
+     * a later write fails.
+     */
+    public void runBoundSettingsUpdate(int account, String expectedContainerId, Runnable changes) {
+        if (changes == null) {
+            throw new IllegalArgumentException("Missing Agram container settings update");
+        }
+        synchronized (sync) {
+            ContainerRecord current = getContainer(account);
+            if (current == null || !current.isStorageAccessible()
+                    || !TextUtils.equals(expectedContainerId, current.id)
+                    || preferences.getBoolean(DELETION_INTENT_PREFIX + current.id, false)) {
+                throw new ContainerIdentityException("Agram container changed while saving settings");
+            }
+            changes.run();
+        }
     }
 
     /**
@@ -222,7 +309,14 @@ public final class AgramContainerManager {
     }
 
     public void markAuthorized(int account) {
+        markAuthorized(account, ensureContainer(account).id);
+    }
+
+    public void markAuthorized(int account, String expectedContainerId) {
         synchronized (sync) {
+            if (!isCurrentContainer(account, expectedContainerId)) {
+                throw new ContainerIdentityException("Authorization belongs to an old container");
+            }
             ContainerRecord record = ensureContainer(account);
             record.profileLocked = true;
             saveRecord(record);
@@ -236,8 +330,70 @@ public final class AgramContainerManager {
 
     public boolean verifyPin(int account, String pin) {
         ContainerRecord record = getContainer(account);
-        if (record == null || TextUtils.isEmpty(record.pinSalt) || TextUtils.isEmpty(record.pinHash)) {
+        if (record == null || !record.isStorageAccessible()) {
+            return false;
+        }
+        if (TextUtils.isEmpty(record.pinSalt) && TextUtils.isEmpty(record.pinHash)) {
             return true;
+        }
+        if (TextUtils.isEmpty(record.pinSalt) || TextUtils.isEmpty(record.pinHash)) {
+            return false;
+        }
+        try {
+            byte[] salt = Base64.decode(record.pinSalt, Base64.NO_WRAP);
+            byte[] expected = Base64.decode(record.pinHash, Base64.NO_WRAP);
+            byte[] actual = derivePin(pin, salt);
+            int diff = expected.length ^ actual.length;
+            for (int i = 0; i < Math.min(expected.length, actual.length); i++) {
+                diff |= expected[i] ^ actual[i];
+            }
+            return diff == 0;
+        } catch (Exception e) {
+            FileLog.e("Unable to verify Agram container PIN", e);
+            return false;
+        }
+    }
+
+    public interface PinVerificationCallback {
+        void onComplete(boolean verified);
+    }
+
+    /** PBKDF2 is intentionally kept off the UI thread. */
+    public void verifyPinAsync(int account, String pin, PinVerificationCallback callback) {
+        if (callback == null) {
+            throw new IllegalArgumentException("Missing Agram PIN verification callback");
+        }
+        final ContainerRecord record = getContainer(account);
+        final String candidate = pin == null ? "" : pin;
+        Utilities.globalQueue.postRunnable(() -> {
+            boolean verified = verifyPinSnapshot(record, candidate);
+            AndroidUtilities.runOnUIThread(() -> {
+                ContainerRecord current;
+                try {
+                    current = getContainer(account);
+                } catch (ContainerPersistenceException e) {
+                    FileLog.e("Unable to revalidate Agram container after PIN verification", e);
+                    current = null;
+                }
+                boolean sameContainer = record != null && current != null
+                        && TextUtils.equals(record.id, current.id)
+                        && TextUtils.equals(record.pinSalt, current.pinSalt)
+                        && TextUtils.equals(record.pinHash, current.pinHash)
+                        && current.isStorageAccessible();
+                callback.onComplete(verified && sameContainer);
+            });
+        });
+    }
+
+    private static boolean verifyPinSnapshot(ContainerRecord record, String pin) {
+        if (record == null || !record.isStorageAccessible()) {
+            return false;
+        }
+        if (TextUtils.isEmpty(record.pinSalt) && TextUtils.isEmpty(record.pinHash)) {
+            return true;
+        }
+        if (TextUtils.isEmpty(record.pinSalt) || TextUtils.isEmpty(record.pinHash)) {
+            return false;
         }
         try {
             byte[] salt = Base64.decode(record.pinSalt, Base64.NO_WRAP);
@@ -297,6 +453,31 @@ public final class AgramContainerManager {
         return ensureContainer(account).ghostModeEnabled;
     }
 
+    public boolean isKeepDeletedMessagesEnabled(int account) {
+        try {
+            ContainerRecord record = getContainer(account);
+            // Unreadable metadata must not turn a preservation setting off and purge rows.
+            return record == null || !record.isStorageAccessible() || record.keepDeletedMessages;
+        } catch (RuntimeException unavailable) {
+            return true;
+        }
+    }
+
+    /** Called from the UUID/session-bound UserConfig setter. */
+    void updateKeepDeletedMessages(int account, boolean enabled) {
+        synchronized (sync) {
+            ContainerRecord record = getContainer(account);
+            if (record == null || !record.isStorageAccessible()) {
+                throw new ContainerIdentityException("Agram container is unavailable");
+            }
+            if (record.keepDeletedMessages == enabled) {
+                return;
+            }
+            record.keepDeletedMessages = enabled;
+            saveRecord(record);
+        }
+    }
+
     public void setGhostModeEnabled(int account, boolean enabled) {
         synchronized (sync) {
             ContainerRecord record = ensureContainer(account);
@@ -339,24 +520,42 @@ public final class AgramContainerManager {
     }
 
     public void deleteContainer(int account) {
+        String expectedId;
+        synchronized (sync) {
+            expectedId = preferences.getString(SLOT_PREFIX + account, null);
+        }
+        deleteContainer(account, expectedId);
+    }
+
+    public boolean deleteContainer(int account, String expectedId) {
         final String id;
         synchronized (sync) {
             id = preferences.getString(SLOT_PREFIX + account, null);
             if (TextUtils.isEmpty(id)) {
-                return;
+                return TextUtils.isEmpty(expectedId);
+            }
+            if (!TextUtils.equals(expectedId, id)) {
+                return false;
+            }
+            if (!canDeleteRetiredContainer(id)) {
+                notifyPersistenceFailure(account, "native_retirement_pending");
+                return false;
             }
             File containerDirectory = getValidatedContainerChild(id, false);
             File tombstone = getValidatedContainerChild(".deleting-" + id, true);
             if (containerDirectory == null || tombstone == null) {
                 FileLog.e("Refusing unsafe Agram container deletion for id=" + id);
-                return;
+                notifyPersistenceFailure(account, "container_delete");
+                return false;
             }
             // Persist the exact validated UUID before touching the directory. This is the
             // durable recovery point if the process dies after rename, or if directory fsync
             // is unavailable on a particular Android filesystem.
-            if (!preferences.edit().putBoolean(DELETION_INTENT_PREFIX + id, true).commit()) {
+            if (!AgramPreferenceTransaction.commit(preferences,
+                    preferences.edit().putBoolean(DELETION_INTENT_PREFIX + id, true), DELETION_INTENT_PREFIX + id)) {
                 FileLog.e("Unable to persist Agram container deletion intent for " + id);
-                return;
+                notifyPersistenceFailure(account, "container_delete");
+                return false;
             }
         }
 
@@ -364,46 +563,61 @@ public final class AgramContainerManager {
         // already be validating the current container through this manager. Invalidation is
         // installed first inside purgeContainer, so after the barrier no worker can recreate it.
         AgramDeletedMediaStore.purgeContainer(account, id);
-        AgramChatExportManager.purgeContainerCache(id);
 
         synchronized (sync) {
             if (!TextUtils.equals(id, preferences.getString(SLOT_PREFIX + account, null))) {
-                return;
+                notifyPersistenceFailure(account, "container_delete_identity");
+                return false;
             }
             File containerDirectory = getValidatedContainerChild(id, false);
             File tombstone = getValidatedContainerChild(".deleting-" + id, true);
             if (containerDirectory == null || tombstone == null) {
                 FileLog.e("Refusing unsafe Agram container deletion for id=" + id);
-                return;
+                notifyPersistenceFailure(account, "container_delete");
+                return false;
             }
             if (containerDirectory.exists()) {
                 if (tombstone.exists()) {
                     FileLog.e("Refusing Agram container deletion because tombstone exists " + tombstone);
-                    return;
+                    scheduleContainerDeletionRetry(id);
+                    notifyPersistenceFailure(account, "container_delete");
+                    return false;
                 }
                 try {
                     moveAtomically(containerDirectory, tombstone);
                     syncDirectory(tombstone.getParentFile());
                 } catch (Throwable e) {
                     FileLog.e("Unable to tombstone Agram container " + containerDirectory, e);
-                    return;
+                    scheduleContainerDeletionRetry(id);
+                    notifyPersistenceFailure(account, "container_delete");
+                    return false;
                 }
             }
-            // Retire the wrapping key after the whole container has a durable deletion name.
-            // Plain archived media remains inside that tombstone and is retried until removed.
-            AgramSecureStore.deleteKey(id);
-            preferences.edit()
+            // Keep the wrapping key until the registry no longer maps this UUID.
+            // Otherwise a failed preferences commit would turn a retryable cleanup
+            // into an unrecoverable, still-mapped container.
+            SharedPreferences.Editor deletion = preferences.edit()
                     .remove(SLOT_PREFIX + account)
                     .remove(METADATA_PREFIX + id)
                     .remove(PUSH_INSTANCE_HASH_PREFIX + id)
-                    .remove(QUARANTINE_PREFIX + id)
-                    .commit();
+                    .remove(QUARANTINE_PREFIX + id);
+            boolean committed = AgramPreferenceTransaction.commit(preferences, deletion,
+                    SLOT_PREFIX + account, METADATA_PREFIX + id,
+                    PUSH_INSTANCE_HASH_PREFIX + id, QUARANTINE_PREFIX + id);
+            if (!committed) {
+                FileLog.e("Unable to finalize Agram container registry deletion for " + id);
+                scheduleContainerDeletionRetry(id);
+                notifyPersistenceFailure(account, "container_delete");
+                return false;
+            }
             recordCache.remove(account);
+            AgramSecureStore.deleteKey(id);
             if (tombstone.exists()) {
                 Utilities.globalQueue.postRunnable(() -> deleteTombstone(tombstone));
             } else {
                 clearDeletionIntent(id);
             }
+            return true;
         }
     }
 
@@ -513,6 +727,7 @@ public final class AgramContainerManager {
         public String pinSalt;
         public String pinHash;
         public boolean biometricEnabled;
+        public boolean keepDeletedMessages;
         public boolean ghostModeEnabled;
         public boolean ghostSuppressReadReceipts;
         public boolean ghostSuppressStoryViews;
@@ -530,6 +745,23 @@ public final class AgramContainerManager {
 
         public boolean hasPin() {
             return !TextUtils.isEmpty(pinHash) && !TextUtils.isEmpty(pinSalt);
+        }
+    }
+
+    /** The requested state was not durably written and must not be presented as saved. */
+    public static class ContainerPersistenceException extends IllegalStateException {
+        public ContainerPersistenceException(String message) {
+            super(message);
+        }
+
+        public ContainerPersistenceException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    public static final class ContainerIdentityException extends ContainerPersistenceException {
+        public ContainerIdentityException(String message) {
+            super(message);
         }
     }
 
@@ -572,7 +804,7 @@ public final class AgramContainerManager {
         boolean enabled = proxy.enabled
                 && NETWORK_PROXY.equals(proxy.mode)
                 && !TextUtils.isEmpty(proxy.address);
-        ApplicationLoader.applicationContext.getSharedPreferences("mainconfig", Context.MODE_PRIVATE)
+        boolean committed = ApplicationLoader.applicationContext.getSharedPreferences("mainconfig", Context.MODE_PRIVATE)
                 .edit()
                 .putBoolean("proxy_enabled", enabled)
                 .putString("proxy_ip", proxy.address)
@@ -581,6 +813,9 @@ public final class AgramContainerManager {
                 .putString("proxy_pass", proxy.password)
                 .putString("proxy_secret", proxy.secret)
                 .commit();
+        if (!committed) {
+            throw new ContainerPersistenceException("Unable to publish selected container proxy settings");
+        }
     }
 
     public static final class ProxyProfile {
@@ -711,6 +946,7 @@ public final class AgramContainerManager {
         record.agramPushEndpoint = "";
         record.agramPushStatus = "not_registered";
         record.notificationPrivacy = NOTIFICATION_HIDDEN;
+        record.keepDeletedMessages = true;
         record.ghostModeEnabled = false;
         record.ghostSuppressReadReceipts = true;
         record.ghostSuppressStoryViews = true;
@@ -726,28 +962,100 @@ public final class AgramContainerManager {
     }
 
     private void saveRecord(ContainerRecord record) {
+        String mappedId = preferences.getString(SLOT_PREFIX + record.account, null);
+        if (!TextUtils.isEmpty(mappedId) && !TextUtils.equals(mappedId, record.id)) {
+            throw new ContainerIdentityException("Refusing to replace another container in this slot");
+        }
+        if (preferences.getBoolean(DELETION_INTENT_PREFIX + record.id, false)) {
+            throw new ContainerIdentityException(
+                    "Refusing to update an Agram container pending deletion " + record.account);
+        }
         if (!record.isStorageAccessible()) {
-            FileLog.e("Refusing to overwrite unavailable Agram container " + record.account
-                    + " (" + record.storageState + ":" + record.storageError + ")");
-            return;
+            throw new ContainerPersistenceException(
+                    "Refusing to overwrite unavailable Agram container " + record.account
+                            + " (" + record.storageState + ":" + record.storageError + ")");
         }
         try {
             byte[] clear = toJson(record).toString().getBytes(StandardCharsets.UTF_8);
-            byte[] encrypted = AgramSecureStore.encrypt(record.id, clear, AgramSecureStore.aad(record.id, "metadata"));
-            preferences.edit()
+            byte[] encrypted = preferences.contains(METADATA_PREFIX + record.id)
+                    ? AgramSecureStore.encryptExisting(record.id, clear, AgramSecureStore.aad(record.id, "metadata"))
+                    : AgramSecureStore.encrypt(record.id, clear, AgramSecureStore.aad(record.id, "metadata"));
+            SharedPreferences.Editor editor = preferences.edit()
                     .putString(SLOT_PREFIX + record.account, record.id)
                     .putString(METADATA_PREFIX + record.id, Base64.encodeToString(encrypted, Base64.NO_WRAP))
                     .putString(PUSH_INSTANCE_HASH_PREFIX + record.id, pushInstanceHash(record.agramPushInstance))
-                    .remove(QUARANTINE_PREFIX + record.id)
-                    .commit();
-            recordCache.put(record.account, record);
+                    .remove(QUARANTINE_PREFIX + record.id);
+            boolean committed = AgramPreferenceTransaction.commit(preferences, editor,
+                    SLOT_PREFIX + record.account, METADATA_PREFIX + record.id,
+                    PUSH_INSTANCE_HASH_PREFIX + record.id, QUARANTINE_PREFIX + record.id);
+            if (!committed) {
+                throw new ContainerPersistenceException("Unable to commit Agram container " + record.account);
+            }
+            recordCache.put(record.account, copyRecord(record));
+        } catch (ContainerPersistenceException e) {
+            recordCache.remove(record.account);
+            throw e;
         } catch (Exception e) {
-            throw new IllegalStateException("Unable to persist Agram container", e);
+            recordCache.remove(record.account);
+            throw new ContainerPersistenceException("Unable to persist Agram container " + record.account, e);
         }
+    }
+
+    private static ContainerRecord copyRecord(ContainerRecord source) {
+        if (source == null) {
+            return null;
+        }
+        ContainerRecord copy = new ContainerRecord();
+        copy.id = source.id;
+        copy.account = source.account;
+        copy.name = source.name;
+        copy.color = source.color;
+        copy.createdAt = source.createdAt;
+        copy.profileMode = source.profileMode;
+        copy.presetIndex = source.presetIndex;
+        copy.deviceModel = source.deviceModel;
+        copy.systemVersion = source.systemVersion;
+        copy.appVersion = source.appVersion;
+        copy.profileId = source.profileId;
+        copy.profileGeneratedAt = source.profileGeneratedAt;
+        copy.profileLocked = source.profileLocked;
+        copy.languageCode = source.languageCode;
+        copy.systemLanguageCode = source.systemLanguageCode;
+        copy.clientLanguageCode = source.clientLanguageCode;
+        copy.fixedTimezone = source.fixedTimezone;
+        copy.timezoneOffset = source.timezoneOffset;
+        copy.proxyMode = source.proxyMode;
+        copy.killSwitch = source.killSwitch;
+        copy.proxyEnabled = source.proxyEnabled;
+        copy.proxyAddress = source.proxyAddress;
+        copy.proxyPort = source.proxyPort;
+        copy.proxyUsername = source.proxyUsername;
+        copy.proxyPassword = source.proxyPassword;
+        copy.proxySecret = source.proxySecret;
+        copy.pushMode = source.pushMode;
+        copy.agramPushInstance = source.agramPushInstance;
+        copy.agramPushEndpoint = source.agramPushEndpoint;
+        copy.agramPushStatus = source.agramPushStatus;
+        copy.notificationPrivacy = source.notificationPrivacy;
+        copy.pinSalt = source.pinSalt;
+        copy.pinHash = source.pinHash;
+        copy.biometricEnabled = source.biometricEnabled;
+        copy.ghostModeEnabled = source.ghostModeEnabled;
+        copy.keepDeletedMessages = source.keepDeletedMessages;
+        copy.ghostSuppressReadReceipts = source.ghostSuppressReadReceipts;
+        copy.ghostSuppressStoryViews = source.ghostSuppressStoryViews;
+        copy.ghostSuppressTyping = source.ghostSuppressTyping;
+        copy.ghostMinimizeOnline = source.ghostMinimizeOnline;
+        copy.ghostReadOnInteraction = source.ghostReadOnInteraction;
+        copy.ghostWarnBeforeInteraction = source.ghostWarnBeforeInteraction;
+        copy.storageState = source.storageState;
+        copy.storageError = source.storageError;
+        return copy;
     }
 
     private ContainerRecord readRecord(int account, String id) {
         try {
+            boolean wasUnavailable = preferences.contains(QUARANTINE_PREFIX + id);
             String encoded = preferences.getString(METADATA_PREFIX + id, null);
             if (TextUtils.isEmpty(encoded)) {
                 return quarantineRecord(account, id, STORAGE_QUARANTINED, "metadata_missing", null);
@@ -768,7 +1076,7 @@ public final class AgramContainerManager {
             if (!expectedHash.equals(preferences.getString(hashKey, ""))) {
                 preferences.edit().putString(hashKey, expectedHash).apply();
             }
-            if (storedSchema < SCHEMA_VERSION || json.has("decoy_codes")
+            if (storedSchema < SCHEMA_VERSION || !json.has("keep_deleted_messages") || json.has("decoy_codes")
                     || LEGACY_NETWORK_TOR.equals(json.optString("proxy_mode", ""))) {
                 // Version 2 removes legacy false-code hashes from encrypted
                 // metadata instead of only hiding their settings UI.
@@ -776,8 +1084,15 @@ public final class AgramContainerManager {
             }
             record.storageState = STORAGE_READY;
             record.storageError = "";
-            preferences.edit().remove(QUARANTINE_PREFIX + id).apply();
+            if (!preferences.edit().remove(QUARANTINE_PREFIX + id).commit()) {
+                FileLog.e("Unable to clear Agram container recovery status for " + id);
+            }
+            if (wasUnavailable) {
+                notifyStorageStateChanged(account, STORAGE_READY, "");
+            }
             return record;
+        } catch (ContainerPersistenceException e) {
+            return quarantineRecord(account, id, STORAGE_LOCKED, "metadata_write_failed", e);
         } catch (Exception e) {
             boolean keyUnavailable = e instanceof AgramSecureStore.KeyUnavailableException;
             return quarantineRecord(account, id,
@@ -823,13 +1138,31 @@ public final class AgramContainerManager {
         record.ghostWarnBeforeInteraction = true;
         record.storageState = state;
         record.storageError = error;
-        preferences.edit().putString(QUARANTINE_PREFIX + id, state + ":" + error).commit();
+        if (!preferences.edit().putString(QUARANTINE_PREFIX + id, state + ":" + error).commit()) {
+            FileLog.e("Unable to persist Agram container recovery status for " + id);
+        }
+        notifyStorageStateChanged(account, state, error);
         if (cause != null) {
             FileLog.e("Agram container " + account + " is " + state + " (" + error + ")", cause);
         } else {
             FileLog.e("Agram container " + account + " is " + state + " (" + error + ")");
         }
         return record;
+    }
+
+    private static void notifyStorageStateChanged(int account, String state, String error) {
+        AndroidUtilities.runOnUIThread(() -> NotificationCenter.getInstance(account).postNotificationName(
+                NotificationCenter.agramContainerStorageStateChanged,
+                account,
+                safe(state),
+                safe(error)));
+    }
+
+    private static void notifyPersistenceFailure(int account, String operation) {
+        AndroidUtilities.runOnUIThread(() -> NotificationCenter.getInstance(account).postNotificationName(
+                NotificationCenter.agramContainerPersistenceFailed,
+                account,
+                operation));
     }
 
     private static String containerReadError(Exception error) {
@@ -885,6 +1218,7 @@ public final class AgramContainerManager {
         json.put("pin_salt", record.pinSalt);
         json.put("pin_hash", record.pinHash);
         json.put("biometric", record.biometricEnabled);
+        json.put("keep_deleted_messages", record.keepDeletedMessages);
         json.put("ghost_enabled", record.ghostModeEnabled);
         json.put("ghost_read", record.ghostSuppressReadReceipts);
         json.put("ghost_stories", record.ghostSuppressStoryViews);
@@ -960,6 +1294,11 @@ public final class AgramContainerManager {
         record.pinSalt = nullable(json, "pin_salt");
         record.pinHash = nullable(json, "pin_hash");
         record.biometricEnabled = json.optBoolean("biometric", false);
+        record.keepDeletedMessages = json.has("keep_deleted_messages")
+                ? json.getBoolean("keep_deleted_messages")
+                : ApplicationLoader.applicationContext.getSharedPreferences(
+                        record.account == 0 ? "mainconfig" : "mainconfig" + record.account, Context.MODE_PRIVATE)
+                        .getBoolean(MessagesController.AGRAM_KEEP_DELETED_MESSAGES, true);
         record.ghostModeEnabled = json.optBoolean("ghost_enabled", false);
         record.ghostSuppressReadReceipts = json.optBoolean("ghost_read", true);
         record.ghostSuppressStoryViews = json.optBoolean("ghost_stories", true);
@@ -1251,6 +1590,7 @@ public final class AgramContainerManager {
     }
 
     private void resumeContainerDeletion(String id) {
+        if (!canDeleteRetiredContainer(id)) return;
         File containerDirectory = getValidatedContainerChild(id, false);
         File tombstone = getValidatedContainerChild(".deleting-" + id, true);
         if (containerDirectory == null || tombstone == null) {
@@ -1272,7 +1612,10 @@ public final class AgramContainerManager {
                 return;
             }
         }
-        finalizeTombstonedContainer(id);
+        if (!finalizeTombstonedContainer(id)) {
+            scheduleContainerDeletionRetry(id);
+            return;
+        }
         if (tombstone.exists()) {
             Utilities.globalQueue.postRunnable(() -> deleteTombstone(tombstone));
         } else {
@@ -1280,22 +1623,41 @@ public final class AgramContainerManager {
         }
     }
 
-    private void finalizeTombstonedContainer(String id) {
-        if (!isStrictUuid(id)) {
-            return;
+    private boolean finalizeTombstonedContainer(String id) {
+        if (!isStrictUuid(id) || !canDeleteRetiredContainer(id)) {
+            return false;
         }
         SharedPreferences.Editor editor = preferences.edit();
         for (int account = 0; account < UserConfig.MAX_ACCOUNT_COUNT; account++) {
             if (TextUtils.equals(id, preferences.getString(SLOT_PREFIX + account, null))) {
                 editor.remove(SLOT_PREFIX + account);
-                recordCache.remove(account);
             }
         }
-        AgramSecureStore.deleteKey(id);
-        editor.remove(METADATA_PREFIX + id)
+        boolean committed = editor.remove(METADATA_PREFIX + id)
                 .remove(PUSH_INSTANCE_HASH_PREFIX + id)
                 .remove(QUARANTINE_PREFIX + id)
                 .commit();
+        if (!committed) {
+            FileLog.e("Unable to finalize Agram container registry deletion for " + id);
+            return false;
+        }
+        for (int account = 0; account < UserConfig.MAX_ACCOUNT_COUNT; account++) {
+            ContainerRecord cached = recordCache.get(account);
+            if (cached != null && TextUtils.equals(id, cached.id)) {
+                recordCache.remove(account);
+            }
+        }
+        // Retire the wrapping key only after the registry commit is durable.
+        AgramSecureStore.deleteKey(id);
+        return true;
+    }
+
+    private void scheduleContainerDeletionRetry(String id) {
+        Utilities.globalQueue.postRunnable(() -> {
+            synchronized (sync) {
+                resumeContainerDeletion(id);
+            }
+        }, 30_000);
     }
 
     private void deleteTombstone(File tombstone) {
@@ -1305,6 +1667,7 @@ public final class AgramContainerManager {
             FileLog.e("Refusing unsafe Agram tombstone deletion " + tombstone);
             return;
         }
+        if (!canDeleteRetiredContainer(validated.getName().substring(".deleting-".length()))) return;
         deleteRecursively(validated, validated);
         syncDirectory(validated.getParentFile());
         if (validated.exists()) {
@@ -1331,20 +1694,20 @@ public final class AgramContainerManager {
             if (hasMappedSlot(id)) {
                 // A prior registry commit may have failed after the tombstone was made. Retry
                 // retiring the exact mapped UUID before dropping the only durable recovery hint.
-                finalizeTombstonedContainer(id);
+                if (!finalizeTombstonedContainer(id)) {
+                    scheduleContainerDeletionRetry(id);
+                    return;
+                }
             }
             File original = getValidatedContainerChild(id, false);
             File tombstone = getValidatedContainerChild(".deleting-" + id, true);
             if (hasMappedSlot(id) || (original != null && original.exists())
                     || (tombstone != null && tombstone.exists())) {
-                Utilities.globalQueue.postRunnable(() -> {
-                    synchronized (sync) {
-                        resumeContainerDeletion(id);
-                    }
-                }, 30_000);
+                scheduleContainerDeletionRetry(id);
                 return;
             }
-            if (!preferences.edit().remove(DELETION_INTENT_PREFIX + id).commit()) {
+            if (!preferences.edit().remove(DELETION_INTENT_PREFIX + id)
+                    .remove(NATIVE_RETIREMENT_PREFIX + id).remove(NATIVE_RETIRED_PREFIX + id).commit()) {
                 FileLog.e("Unable to clear Agram container deletion intent for " + id);
             }
         }

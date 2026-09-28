@@ -4,6 +4,5 @@
     <files-path name="logs" path="/logs/"/>
     <files-path name="cache" path="/cache/"/>
     <files-path name="agram_deleted_media" path="agram_containers/"/>
-    <cache-path name="agram_chat_exports" path="agram_chat_exports/"/>
     <root-path name="external_files" path="/storage/" />
 </paths>

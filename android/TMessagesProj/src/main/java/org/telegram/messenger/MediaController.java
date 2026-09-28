@@ -71,14 +71,17 @@ import android.webkit.MimeTypeMap;
 import android.widget.FrameLayout;
 
 import androidx.annotation.Nullable;
+import androidx.annotation.OptIn;
 import androidx.exifinterface.media.ExifInterface;
 
-import com.google.android.exoplayer2.C;
-import com.google.android.exoplayer2.ExoPlayer;
-import com.google.android.exoplayer2.Player;
-import com.google.android.exoplayer2.extractor.jpeg.MotionPhotoDescription;
-import com.google.android.exoplayer2.extractor.jpeg.XmpMotionPhotoDescriptionParser;
-import com.google.android.exoplayer2.ui.AspectRatioFrameLayout;
+import androidx.media3.common.C;
+import androidx.media3.common.util.UnstableApi;
+import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.common.Player;
+import androidx.media3.extractor.jpeg.MotionPhotoDescription;
+import androidx.media3.extractor.jpeg.XmpMotionPhotoDescriptionParser;
+
+import org.telegram.ui.AspectRatioFrameLayout;
 import com.google.android.gms.cast.MediaMetadata;
 import com.google.android.gms.common.images.WebImage;
 
@@ -777,7 +780,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
             }
         }
 
-        public void rebuildPhoto(boolean highQuality) {
+        public void rebuildPhoto(int account, boolean highQuality) {
             final Pair<Integer, Integer> orientation = AndroidUtilities.getImageOrientation(filterPath != null ? filterPath : path);
             final Bitmap.CompressFormat compressFormat = Bitmap.CompressFormat.JPEG;
             final Bitmap bitmap = StoryEntry.getScaledBitmap(opts -> BitmapFactory.decodeFile(filterPath != null ? filterPath : path, opts), AndroidUtilities.getPhotoSize(highQuality), AndroidUtilities.getPhotoSize(highQuality), false, true);
@@ -805,8 +808,8 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
                 }
             }
             if (fullPaintPath == null) {
-                TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(b, compressFormat, AndroidUtilities.getPhotoSize(highQuality), AndroidUtilities.getPhotoSize(highQuality), highQuality ? 99 : 87, false, 101, 101);
-                imagePath = FileLoader.getInstance(UserConfig.selectedAccount).getPathToAttach(size, true).toString();
+                TLRPC.PhotoSize size = ImageLoader.scaleAndSaveImage(account, b, compressFormat, AndroidUtilities.getPhotoSize(highQuality), AndroidUtilities.getPhotoSize(highQuality), highQuality ? 99 : 87, false, 101, 101);
+                imagePath = FileLoader.getInstance(account).getPathToAttach(size, true).toString();
             } else {
                 Bitmap paintBitmap;
                 if (cropState != null) {
@@ -825,7 +828,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
                     canvas.scale(b.getWidth() / (float) paintBitmap.getWidth(), b.getHeight() / (float) paintBitmap.getHeight());
                     canvas.drawBitmap(paintBitmap, 0, 0, bitmapPaint);
 
-                    imagePath = getTempFileAbsolutePath();
+                    imagePath = getTempFileAbsolutePath(account);
                     resultBitmap.compress(Bitmap.CompressFormat.JPEG, highQuality ? 99 : 87, new FileOutputStream(imagePath));
                 } catch (Exception e) {
                     FileLog.e(e);
@@ -841,6 +844,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
     }
 
     public static class SearchImage extends MediaEditState {
+        public final int ownerAccount;
         public String id;
         public String imageUrl;
         public String thumbUrl;
@@ -857,14 +861,18 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
         public TLRPC.BotInlineResult inlineResult;
         public HashMap<String, String> params;
 
+        public SearchImage(int ownerAccount) {
+            this.ownerAccount = ownerAccount;
+        }
+
         @Override
         public String getPath() {
             if (photoSize != null) {
-                return FileLoader.getInstance(UserConfig.selectedAccount).getPathToAttach(photoSize, true).getAbsolutePath();
+                return FileLoader.getInstance(ownerAccount).getPathToAttach(photoSize, true).getAbsolutePath();
             } else if (document != null) {
-                return FileLoader.getInstance(UserConfig.selectedAccount).getPathToAttach(document, true).getAbsolutePath();
+                return FileLoader.getInstance(ownerAccount).getPathToAttach(document, true).getAbsolutePath();
             } else {
-                return ImageLoader.getHttpFilePath(imageUrl, "jpg").getAbsolutePath();
+                return ImageLoader.getHttpFilePath(ownerAccount, imageUrl, "jpg").getAbsolutePath();
             }
         }
 
@@ -884,16 +892,16 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
 
         public String getPathToAttach() {
             if (photoSize != null) {
-                return FileLoader.getInstance(UserConfig.selectedAccount).getPathToAttach(photoSize, true).getAbsolutePath();
+                return FileLoader.getInstance(ownerAccount).getPathToAttach(photoSize, true).getAbsolutePath();
             } else if (document != null) {
-                return FileLoader.getInstance(UserConfig.selectedAccount).getPathToAttach(document, true).getAbsolutePath();
+                return FileLoader.getInstance(ownerAccount).getPathToAttach(document, true).getAbsolutePath();
             } else {
                 return imageUrl;
             }
         }
 
         public SearchImage clone() {
-            SearchImage searchImage = new SearchImage();
+            SearchImage searchImage = new SearchImage(ownerAccount);
             searchImage.id = id;
             searchImage.imageUrl = imageUrl;
             searchImage.thumbUrl = thumbUrl;
@@ -4195,7 +4203,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
                     if (audioInfo.getCover() != null) {
                         File coverFile = audioInfo.getCoverFile();
                         if (coverFile == null || !coverFile.exists()) {
-                            coverFile = StoryEntry.makeCacheFile(UserConfig.selectedAccount, "jpg");
+                            coverFile = StoryEntry.makeCacheFile(playingMessageObject.currentAccount, "jpg");
                             FileOutputStream stream = null;
                             try {
                                 audioInfo.getCover().compress(Bitmap.CompressFormat.JPEG, 80, stream = new FileOutputStream(coverFile));
@@ -4483,7 +4491,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
                     return super.delete();
                 }
             };
-            FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE).mkdirs();
+            FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_CACHE).mkdirs();
             AutoDeleteMediaTask.lockFile(recordingAudioFile);
             try {
                 audioRecorderPaused = true;
@@ -4555,7 +4563,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
 
     private File joinRecord(File prevFile, File currentFile, TLRPC.TL_document document) {
         if (prevFile != null && currentFile != null) {
-            File newFile = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_AUDIO), System.currentTimeMillis() + "_" + FileLoader.getAttachFileName(document)) {
+            File newFile = new File(FileLoader.getDirectory(recordingCurrentAccount, FileLoader.MEDIA_DIR_AUDIO), System.currentTimeMillis() + "_" + FileLoader.getAttachFileName(document)) {
                 @Override
                 public boolean delete() {
                     if (BuildVars.LOGS_ENABLED) {
@@ -4588,7 +4596,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
             }
             return;
         }
-        File newFile = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_AUDIO), System.currentTimeMillis() + "_" + FileLoader.getAttachFileName(recordingAudio)) {
+        File newFile = new File(FileLoader.getDirectory(recordingCurrentAccount, FileLoader.MEDIA_DIR_AUDIO), System.currentTimeMillis() + "_" + FileLoader.getAttachFileName(recordingAudio)) {
             @Override
             public boolean delete() {
                 if (BuildVars.LOGS_ENABLED) {
@@ -4661,7 +4669,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
                 recordQueue.cancelRunnable(recordRunnable);
                 recordQueue.postRunnable(() -> {
                     recordingPrevAudioFile = recordingAudioFile;
-                    recordingAudioFile = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_AUDIO), System.currentTimeMillis() + "_" + FileLoader.getAttachFileName(recordingAudio)) {
+                    recordingAudioFile = new File(FileLoader.getDirectory(recordingCurrentAccount, FileLoader.MEDIA_DIR_AUDIO), System.currentTimeMillis() + "_" + FileLoader.getAttachFileName(recordingAudio)) {
                         @Override
                         public boolean delete() {
                             if (BuildVars.LOGS_ENABLED) {
@@ -4735,7 +4743,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
             recordingAudio.file_reference = new byte[0];
             SharedConfig.saveConfig();
 
-            recordingAudioFile = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_AUDIO), System.currentTimeMillis() + "_" + FileLoader.getAttachFileName(recordingAudio)) {
+            recordingAudioFile = new File(FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_AUDIO), System.currentTimeMillis() + "_" + FileLoader.getAttachFileName(recordingAudio)) {
                 @Override
                 public boolean delete() {
                     if (BuildVars.LOGS_ENABLED) {
@@ -4744,7 +4752,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
                     return super.delete();
                 }
             };
-            FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE).mkdirs();
+            FileLoader.getDirectory(currentAccount, FileLoader.MEDIA_DIR_CACHE).mkdirs();
             if (BuildVars.LOGS_ENABLED) {
                 FileLog.d("start recording internal " + recordingAudioFile.getPath() + " " + recordingAudioFile.exists());
             }
@@ -6017,12 +6025,12 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
         return null;
     }
 
-    public static String copyFileToCache(Uri uri, String ext) {
-        return copyFileToCache(uri, ext, -1);
+    public static String copyFileToCache(int account, Uri uri, String ext) {
+        return copyFileToCache(account, uri, ext, -1);
     }
 
     @SuppressLint("DiscouragedPrivateApi")
-    public static String copyFileToCache(Uri uri, String ext, long sizeLimit) {
+    public static String copyFileToCache(int account, Uri uri, String ext, long sizeLimit) {
         InputStream inputStream = null;
         FileOutputStream output = null;
         int totalLen = 0;
@@ -6034,14 +6042,14 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
                 SharedConfig.saveConfig();
                 name = String.format(Locale.US, "%d.%s", id, ext);
             }
-            f = AndroidUtilities.getSharingDirectory();
+            f = AndroidUtilities.getSharingDirectory(account);
             f.mkdirs();
             if (AndroidUtilities.isInternalUri(Uri.fromFile(f))) {
                 return null;
             }
             int count = 0;
             do {
-                f = AndroidUtilities.getSharingDirectory();
+                f = AndroidUtilities.getSharingDirectory(account);
                 if (count == 0) {
                     f = new File(f, name);
                 } else {

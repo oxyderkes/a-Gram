@@ -2,13 +2,11 @@ package org.telegram.messenger;
 
 import static org.telegram.messenger.CacheByChatsController.KEEP_MEDIA_TYPE_STORIES;
 
-import android.util.SparseArray;
-
-import com.google.android.exoplayer2.util.Log;
-
 import java.io.File;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -22,8 +20,6 @@ public class AutoDeleteMediaTask {
             return;
         }
         SharedConfig.lastKeepMediaCheckTime = time;
-        File cacheDir = FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE);
-
         Utilities.cacheClearQueue.postRunnable(() -> {
             long startTime = System.currentTimeMillis();
             if (BuildVars.LOGS_ENABLED) {
@@ -66,16 +62,15 @@ public class AutoDeleteMediaTask {
 
             //if (!allKeepMediaTypesForever) {
                 //long currentTime = time - 60 * 60 * 24 * days;
-                final SparseArray<File> paths = ImageLoader.getInstance().createMediaPaths();
+                final ArrayList<MediaDirectory> paths = getManagedMediaDirectories();
+                final ArrayList<MediaDirectory> recursivePaths = getTopLevelMediaDirectories(paths);
                 for (int a = 0; a < paths.size(); a++) {
-                    if (allKeepMediaTypesForever && (paths.keyAt(a) == FileLoader.MEDIA_DIR_AUDIO || paths.keyAt(a) == FileLoader.MEDIA_DIR_DOCUMENT)) {
+                    MediaDirectory mediaDirectory = paths.get(a);
+                    if (allKeepMediaTypesForever && (mediaDirectory.type == FileLoader.MEDIA_DIR_AUDIO || mediaDirectory.type == FileLoader.MEDIA_DIR_DOCUMENT)) {
                         continue;
                     }
-                    boolean isCacheDir = false;
-                    if (paths.keyAt(a) == FileLoader.MEDIA_DIR_CACHE) {
-                        isCacheDir = true;
-                    }
-                    File dir = paths.valueAt(a);
+                    boolean isCacheDir = mediaDirectory.type == FileLoader.MEDIA_DIR_CACHE;
+                    File dir = mediaDirectory.file;
                     try {
                         File[] files = dir.listFiles();
                         ArrayList<CacheByChatsController.KeepMediaFile> keepMediaFiles = new ArrayList<>();
@@ -147,13 +142,13 @@ public class AutoDeleteMediaTask {
                     maxCacheSize = maxCacheGb * 1024L * 1024L * 1000L;
                 }
                 long totalSize = 0;
-                for (int a = 0; a < paths.size(); a++) {
-                    totalSize += Utilities.getDirSize(paths.valueAt(a).getAbsolutePath(), 0, true);
+                for (int a = 0; a < recursivePaths.size(); a++) {
+                    totalSize += Utilities.getDirSize(recursivePaths.get(a).file.getAbsolutePath(), 0, true);
                 }
                 if (totalSize > maxCacheSize) {
                     ArrayList<FileInfoInternal> allFiles = new ArrayList<>();
-                    for (int a = 0; a < paths.size(); a++) {
-                        File dir = paths.valueAt(a);
+                    for (int a = 0; a < recursivePaths.size(); a++) {
+                        File dir = recursivePaths.get(a).file;
                         fillFilesRecursive(dir, allFiles);
                     }
                     for (int i = 0; i < cacheByChatsControllers.size(); i++) {
@@ -191,13 +186,15 @@ public class AutoDeleteMediaTask {
                 }
             }
 
-            File stickersPath = new File(cacheDir, "acache");
-            if (stickersPath.exists()) {
-                long currentTime = time - 60 * 60 * 24;
-                try {
-                    Utilities.clearDir(stickersPath.getAbsolutePath(), 0, currentTime, false);
-                } catch (Throwable e) {
-                    FileLog.e(e);
+            long currentTime = time - 60 * 60 * 24;
+            for (File cacheDir : FileLoader.getAllDirectories(FileLoader.MEDIA_DIR_CACHE)) {
+                File stickersPath = new File(cacheDir, "acache");
+                if (stickersPath.exists()) {
+                    try {
+                        Utilities.clearDir(stickersPath.getAbsolutePath(), 0, currentTime, false);
+                    } catch (Throwable e) {
+                        FileLog.e(e);
+                    }
                 }
             }
             MessagesController.getGlobalMainSettings().edit()
@@ -208,6 +205,80 @@ public class AutoDeleteMediaTask {
                 FileLog.d("checkKeepMedia task end time " + (System.currentTimeMillis() - startTime) + " auto deleted info: files " + autoDeletedFiles + " size " + AndroidUtilities.formatFileSize(autoDeletedFilesSize) + "   deleted by size limit info: files " + deletedFilesBySize + " size " + AndroidUtilities.formatFileSize(deletedFilesBySizeSize) + " unknownTimeFiles " + skippedFiles);
             }
         });
+    }
+
+    /**
+     * Cache maintenance is application-wide. Enumerate all UUID-scoped roots explicitly instead
+     * of inheriting the account that happens to be selected when this background task runs.
+     * Cache is visited first so a fallback root shared by several media types keeps cache
+     * semantics and is never scanned or charged more than once.
+     */
+    private static ArrayList<MediaDirectory> getManagedMediaDirectories() {
+        final int[] types = {
+                FileLoader.MEDIA_DIR_CACHE,
+                FileLoader.MEDIA_DIR_IMAGE,
+                FileLoader.MEDIA_DIR_AUDIO,
+                FileLoader.MEDIA_DIR_VIDEO,
+                FileLoader.MEDIA_DIR_DOCUMENT,
+                FileLoader.MEDIA_DIR_FILES,
+                FileLoader.MEDIA_DIR_STORIES,
+                FileLoader.MEDIA_DIR_IMAGE_PUBLIC,
+                FileLoader.MEDIA_DIR_VIDEO_PUBLIC
+        };
+        ArrayList<MediaDirectory> result = new ArrayList<>();
+        HashSet<String> seen = new HashSet<>();
+        for (int type : types) {
+            for (File directory : FileLoader.getAllDirectories(type)) {
+                if (directory == null) {
+                    continue;
+                }
+                String key;
+                try {
+                    key = directory.getCanonicalPath();
+                } catch (IOException e) {
+                    key = directory.getAbsolutePath();
+                }
+                if (seen.add(key)) {
+                    result.add(new MediaDirectory(type, directory));
+                }
+            }
+        }
+        return result;
+    }
+
+    private static ArrayList<MediaDirectory> getTopLevelMediaDirectories(ArrayList<MediaDirectory> directories) {
+        ArrayList<MediaDirectory> result = new ArrayList<>();
+        ArrayList<String> roots = new ArrayList<>();
+        for (MediaDirectory directory : directories) {
+            String path;
+            try {
+                path = directory.file.getCanonicalPath();
+            } catch (IOException e) {
+                path = directory.file.getAbsolutePath();
+            }
+            boolean covered = false;
+            for (String root : roots) {
+                if (path.equals(root) || path.startsWith(root + File.separator)) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered) {
+                roots.add(path);
+                result.add(directory);
+            }
+        }
+        return result;
+    }
+
+    private static class MediaDirectory {
+        final int type;
+        final File file;
+
+        MediaDirectory(int type, File file) {
+            this.type = type;
+            this.file = file;
+        }
     }
 
     private static void fillFilesRecursive(final File fromFolder, ArrayList<FileInfoInternal> fileInfoList) {

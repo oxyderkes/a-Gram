@@ -222,13 +222,14 @@ public class CacheControlActivity extends BaseFragment implements NotificationCe
 
     private static long lastTotalSizeCalculatedTime;
     private static Long lastTotalSizeCalculated;
+    private static int lastTotalSizeCalculatedAccount = -1;
     private static Long lastDeviceTotalSize, lastDeviceTotalFreeSize;
 
-    public static void calculateTotalSize(Utilities.Callback<Long> onDone) {
+    public static void calculateTotalSize(int account, Utilities.Callback<Long> onDone) {
         if (onDone == null) {
             return;
         }
-        if (lastTotalSizeCalculated != null) {
+        if (lastTotalSizeCalculated != null && lastTotalSizeCalculatedAccount == account) {
             onDone.run(lastTotalSizeCalculated);
             if (System.currentTimeMillis() - lastTotalSizeCalculatedTime < 5000) {
                 return;
@@ -236,25 +237,26 @@ public class CacheControlActivity extends BaseFragment implements NotificationCe
         }
         Utilities.cacheClearQueue.postRunnable(() -> {
             canceled = false;
-            long cacheSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE), 5);
-            long cacheTempSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE), 4);
-            long photoSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_IMAGE), 0);
-            photoSize += getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_IMAGE_PUBLIC), 0);
-            long videoSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_VIDEO), 0);
-            videoSize += getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_VIDEO_PUBLIC), 0);
-            long documentsSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_DOCUMENT), 1);
-            documentsSize += getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_FILES), 1);
-            long musicSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_DOCUMENT), 2);
-            musicSize += getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_FILES), 2);
-            long stickersCacheSize = getDirectorySize(new File(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE), "acache"), 0);
-            stickersCacheSize += getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE), 3);
-            long audioSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_AUDIO), 0);
-            long storiesSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_STORIES), 0);
+            long cacheSize = getAccountDirectorySize(account, FileLoader.MEDIA_DIR_CACHE, 5);
+            long cacheTempSize = getAccountDirectorySize(account, FileLoader.MEDIA_DIR_CACHE, 4);
+            long photoSize = getAccountDirectorySize(account, FileLoader.MEDIA_DIR_IMAGE, 0);
+            photoSize += getAccountDirectorySize(account, FileLoader.MEDIA_DIR_IMAGE_PUBLIC, 0);
+            long videoSize = getAccountDirectorySize(account, FileLoader.MEDIA_DIR_VIDEO, 0);
+            videoSize += getAccountDirectorySize(account, FileLoader.MEDIA_DIR_VIDEO_PUBLIC, 0);
+            long documentsSize = getAccountDirectorySize(account, FileLoader.MEDIA_DIR_DOCUMENT, 1);
+            documentsSize += getAccountDirectorySize(account, FileLoader.MEDIA_DIR_FILES, 1);
+            long musicSize = getAccountDirectorySize(account, FileLoader.MEDIA_DIR_DOCUMENT, 2);
+            musicSize += getAccountDirectorySize(account, FileLoader.MEDIA_DIR_FILES, 2);
+            long stickersCacheSize = getAccountSubdirectorySize(account, FileLoader.MEDIA_DIR_CACHE, "acache", 0);
+            stickersCacheSize += getAccountDirectorySize(account, FileLoader.MEDIA_DIR_CACHE, 3);
+            long audioSize = getAccountDirectorySize(account, FileLoader.MEDIA_DIR_AUDIO, 0);
+            long storiesSize = getAccountDirectorySize(account, FileLoader.MEDIA_DIR_STORIES, 0);
             long logsSize = getDirectorySize(AndroidUtilities.getLogsDir(), 1);
             if (!BuildVars.DEBUG_VERSION && logsSize < 1024 * 1024 * 256) {
                 logsSize = 0;
             }
             final long totalSize = lastTotalSizeCalculated = cacheSize + cacheTempSize + videoSize + audioSize + photoSize + documentsSize + musicSize + stickersCacheSize + storiesSize + logsSize;
+            lastTotalSizeCalculatedAccount = account;
             lastTotalSizeCalculatedTime = System.currentTimeMillis();
             if (!canceled) {
                 AndroidUtilities.runOnUIThread(() -> {
@@ -266,6 +268,7 @@ public class CacheControlActivity extends BaseFragment implements NotificationCe
 
     public static void resetCalculatedTotalSIze() {
         lastTotalSizeCalculated = null;
+        lastTotalSizeCalculatedAccount = -1;
     }
 
     public static void getDeviceTotalSize(Utilities.Callback2<Long, Long> onDone) {
@@ -316,23 +319,23 @@ public class CacheControlActivity extends BaseFragment implements NotificationCe
         loadingDialogs = true;
 
         Utilities.globalQueue.postRunnable(() -> {
-            cacheSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE), 5);
+            cacheSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_CACHE, 5);
             if (canceled) {
                 return;
             }
 
-            cacheTempSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE), 4);
+            cacheTempSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_CACHE, 4);
             if (canceled) {
                 return;
             }
 
-            photoSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_IMAGE), 0);
-            photoSize += getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_IMAGE_PUBLIC), 0);
+            photoSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_IMAGE, 0);
+            photoSize += getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_IMAGE_PUBLIC, 0);
             if (canceled) {
                 return;
             }
-            videoSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_VIDEO), 0);
-            videoSize += getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_VIDEO_PUBLIC), 0);
+            videoSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_VIDEO, 0);
+            videoSize += getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_VIDEO_PUBLIC, 0);
             if (canceled) {
                 return;
             }
@@ -343,31 +346,32 @@ public class CacheControlActivity extends BaseFragment implements NotificationCe
             if (canceled) {
                 return;
             }
-            documentsSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_DOCUMENT), 1);
-            documentsSize += getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_FILES), 1);
+            documentsSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_DOCUMENT, 1);
+            documentsSize += getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_FILES, 1);
             if (canceled) {
                 return;
             }
-            musicSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_DOCUMENT), 2);
-            musicSize += getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_FILES), 2);
+            musicSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_DOCUMENT, 2);
+            musicSize += getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_FILES, 2);
             if (canceled) {
                 return;
             }
-            stickersCacheSize = getDirectorySize(new File(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE), "acache"), 0);
+            stickersCacheSize = getAccountSubdirectorySize(currentAccount, FileLoader.MEDIA_DIR_CACHE, "acache", 0);
             if (canceled) {
                 return;
             }
-            cacheEmojiSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE), 3);
+            cacheEmojiSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_CACHE, 3);
             if (canceled) {
                 return;
             }
             stickersCacheSize += cacheEmojiSize;
-            audioSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_AUDIO), 0);
-            storiesSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_STORIES), 0);
+            audioSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_AUDIO, 0);
+            storiesSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_STORIES, 0);
             if (canceled) {
                 return;
             }
             totalSize = lastTotalSizeCalculated = cacheSize + cacheTempSize + videoSize + logsSize + audioSize + photoSize + documentsSize + musicSize + storiesSize + stickersCacheSize;
+            lastTotalSizeCalculatedAccount = currentAccount;
             lastTotalSizeCalculatedTime = System.currentTimeMillis();
 
             File path;
@@ -448,18 +452,18 @@ public class CacheControlActivity extends BaseFragment implements NotificationCe
             CacheModel cacheModel = new CacheModel(false);
             LongSparseArray<DialogFileEntities> dilogsFilesEntities = new LongSparseArray<>();
 
-            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE), TYPE_OTHER, dilogsFilesEntities, cacheModel);
+            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(currentAccount, FileLoader.MEDIA_DIR_CACHE), TYPE_OTHER, dilogsFilesEntities, cacheModel);
 
-            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_IMAGE), TYPE_PHOTOS, dilogsFilesEntities, cacheModel);
-            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_IMAGE_PUBLIC), TYPE_PHOTOS, dilogsFilesEntities, cacheModel);
+            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(currentAccount, FileLoader.MEDIA_DIR_IMAGE), TYPE_PHOTOS, dilogsFilesEntities, cacheModel);
+            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(currentAccount, FileLoader.MEDIA_DIR_IMAGE_PUBLIC), TYPE_PHOTOS, dilogsFilesEntities, cacheModel);
 
-            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_VIDEO), TYPE_VIDEOS, dilogsFilesEntities, cacheModel);
-            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_VIDEO_PUBLIC), TYPE_VIDEOS, dilogsFilesEntities, cacheModel);
+            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(currentAccount, FileLoader.MEDIA_DIR_VIDEO), TYPE_VIDEOS, dilogsFilesEntities, cacheModel);
+            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(currentAccount, FileLoader.MEDIA_DIR_VIDEO_PUBLIC), TYPE_VIDEOS, dilogsFilesEntities, cacheModel);
 
-            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_AUDIO), TYPE_VOICE, dilogsFilesEntities, cacheModel);
-            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_STORIES), TYPE_OTHER, dilogsFilesEntities, cacheModel);
-            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_DOCUMENT), TYPE_DOCUMENTS, dilogsFilesEntities, cacheModel);
-            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_FILES), TYPE_DOCUMENTS, dilogsFilesEntities, cacheModel);
+            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(currentAccount, FileLoader.MEDIA_DIR_AUDIO), TYPE_VOICE, dilogsFilesEntities, cacheModel);
+            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(currentAccount, FileLoader.MEDIA_DIR_STORIES), TYPE_OTHER, dilogsFilesEntities, cacheModel);
+            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(currentAccount, FileLoader.MEDIA_DIR_DOCUMENT), TYPE_DOCUMENTS, dilogsFilesEntities, cacheModel);
+            fillDialogsEntitiesRecursive(FileLoader.checkDirectory(currentAccount, FileLoader.MEDIA_DIR_FILES), TYPE_DOCUMENTS, dilogsFilesEntities, cacheModel);
 
             ArrayList<DialogFileEntities> entities = new ArrayList<>();
             ArrayList<Long> unknownUsers = new ArrayList<>();
@@ -817,6 +821,29 @@ public class CacheControlActivity extends BaseFragment implements NotificationCe
         return size;
     }
 
+    private static long getAccountDirectorySize(int account, int mediaDirType, int documentsMusicType) {
+        return getDirectorySize(FileLoader.checkDirectory(account, mediaDirType), documentsMusicType);
+    }
+
+    private static long getAccountSubdirectorySize(int account, int mediaDirType, String childName, int documentsMusicType) {
+        File directory = FileLoader.checkDirectory(account, mediaDirType);
+        return directory == null ? 0 : getDirectorySize(new File(directory, childName), documentsMusicType);
+    }
+
+    private static void cleanAccountDirectory(int account, int mediaDirType, int documentsMusicType, Utilities.Callback<Float> onProgress) {
+        File directory = FileLoader.checkDirectory(account, mediaDirType);
+        if (directory != null) {
+            cleanDirJava(directory.getAbsolutePath(), documentsMusicType, null, onProgress);
+        }
+    }
+
+    private static void cleanAccountSubdirectory(int account, int mediaDirType, String childName, int documentsMusicType, Utilities.Callback<Float> onProgress) {
+        File directory = FileLoader.checkDirectory(account, mediaDirType);
+        if (directory != null) {
+            cleanDirJava(new File(directory, childName).getAbsolutePath(), documentsMusicType, null, onProgress);
+        }
+    }
+
     private void cleanupFolders(Utilities.Callback2<Float, Boolean> onProgress, Runnable onDone) {
         if (cacheModel != null) {
             cacheModel.clearSelection();
@@ -830,9 +857,8 @@ public class CacheControlActivity extends BaseFragment implements NotificationCe
 //        progressDialog.setCanCancel(false);
 //        progressDialog.showDelayed(500);
         getFileLoader().cancelLoadAllFiles();
-        getFileLoader().getFileLoaderQueue().postRunnable(() -> Utilities.globalQueue.postRunnable(() -> {
-            cleanupFoldersInternal(onProgress, onDone);
-        }));
+        getFileLoader().getFileLoaderQueue().postRunnable(() ->
+                Utilities.globalQueue.postRunnable(() -> cleanupFoldersInternal(onProgress, onDone)));
         setCacheModel(null);
         loadingDialogs = true;
 //        updateRows();
@@ -1005,24 +1031,20 @@ public class CacheControlActivity extends BaseFragment implements NotificationCe
                     FileLog.e(e);
                 }
             }
-            File file;
             if (a == 9) {
-                file = AndroidUtilities.getLogsDir();
+                File file = AndroidUtilities.getLogsDir();
+                if (file != null) {
+                    cleanDirJava(file.getAbsolutePath(), documentsMusicType, null, updateProgress);
+                }
             } else if (type == 100) {
-                file = new File(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE), "acache");
+                cleanAccountSubdirectory(currentAccount, FileLoader.MEDIA_DIR_CACHE, "acache", documentsMusicType, updateProgress);
             } else {
-                file = FileLoader.checkDirectory(type);
-            }
-            if (file != null) {
-                cleanDirJava(file.getAbsolutePath(), documentsMusicType, null, updateProgress);
+                cleanAccountDirectory(currentAccount, type, documentsMusicType, updateProgress);
             }
             clearDirI[0]++;
             next.run();
             if (type == 100) {
-                file = FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE);
-                if (file != null) {
-                    cleanDirJava(file.getAbsolutePath(), 3, null, updateProgress);
-                }
+                cleanAccountDirectory(currentAccount, FileLoader.MEDIA_DIR_CACHE, 3, updateProgress);
                 clearDirI[0]++;
                 next.run();
             }
@@ -1033,19 +1055,12 @@ public class CacheControlActivity extends BaseFragment implements NotificationCe
                 } else {
                     publicDirectoryType = FileLoader.MEDIA_DIR_VIDEO_PUBLIC;
                 }
-                file = FileLoader.checkDirectory(publicDirectoryType);
-
-                if (file != null) {
-                    cleanDirJava(file.getAbsolutePath(), documentsMusicType, null, updateProgress);
-                }
+                cleanAccountDirectory(currentAccount, publicDirectoryType, documentsMusicType, updateProgress);
                 clearDirI[0]++;
                 next.run();
             }
             if (type == FileLoader.MEDIA_DIR_DOCUMENT) {
-                file = FileLoader.checkDirectory(FileLoader.MEDIA_DIR_FILES);
-                if (file != null) {
-                    cleanDirJava(file.getAbsolutePath(), documentsMusicType, null, updateProgress);
-                }
+                cleanAccountDirectory(currentAccount, FileLoader.MEDIA_DIR_FILES, documentsMusicType, updateProgress);
                 clearDirI[0]++;
                 next.run();
             }
@@ -1053,37 +1068,38 @@ public class CacheControlActivity extends BaseFragment implements NotificationCe
             if (a == 9) {
                 logsSize = getDirectorySize(AndroidUtilities.getLogsDir(), 1);
             } else if (type == FileLoader.MEDIA_DIR_CACHE) {
-                cacheSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE), 5);
-                cacheTempSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE), 4);
+                cacheSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_CACHE, 5);
+                cacheTempSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_CACHE, 4);
                 imagesCleared = true;
             } else if (type == FileLoader.MEDIA_DIR_AUDIO) {
-                audioSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_AUDIO), documentsMusicType);
+                audioSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_AUDIO, documentsMusicType);
             } else if (type == FileLoader.MEDIA_DIR_STORIES) {
-                storiesSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_STORIES), documentsMusicType);
+                storiesSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_STORIES, documentsMusicType);
             } else if (type == FileLoader.MEDIA_DIR_DOCUMENT) {
                 if (documentsMusicType == 1) {
-                    documentsSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_DOCUMENT), documentsMusicType);
-                    documentsSize += getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_FILES), documentsMusicType);
+                    documentsSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_DOCUMENT, documentsMusicType);
+                    documentsSize += getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_FILES, documentsMusicType);
                 } else {
-                    musicSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_DOCUMENT), documentsMusicType);
-                    musicSize += getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_FILES), documentsMusicType);
+                    musicSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_DOCUMENT, documentsMusicType);
+                    musicSize += getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_FILES, documentsMusicType);
                 }
             } else if (type == FileLoader.MEDIA_DIR_IMAGE) {
                 imagesCleared = true;
-                photoSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_IMAGE), documentsMusicType);
-                photoSize += getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_IMAGE_PUBLIC), documentsMusicType);
+                photoSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_IMAGE, documentsMusicType);
+                photoSize += getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_IMAGE_PUBLIC, documentsMusicType);
             } else if (type == FileLoader.MEDIA_DIR_VIDEO) {
-                videoSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_VIDEO), documentsMusicType);
-                videoSize += getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_VIDEO_PUBLIC), documentsMusicType);
+                videoSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_VIDEO, documentsMusicType);
+                videoSize += getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_VIDEO_PUBLIC, documentsMusicType);
             } else if (type == 100) {
                 imagesCleared = true;
-                stickersCacheSize = getDirectorySize(new File(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE), "acache"), documentsMusicType);
-                cacheEmojiSize = getDirectorySize(FileLoader.checkDirectory(FileLoader.MEDIA_DIR_CACHE), 3);
+                stickersCacheSize = getAccountSubdirectorySize(currentAccount, FileLoader.MEDIA_DIR_CACHE, "acache", documentsMusicType);
+                cacheEmojiSize = getAccountDirectorySize(currentAccount, FileLoader.MEDIA_DIR_CACHE, 3);
                 stickersCacheSize += cacheEmojiSize;
             }
         }
         final boolean imagesClearedFinal = imagesCleared;
         totalSize = lastTotalSizeCalculated = cacheSize + cacheTempSize + logsSize + videoSize + audioSize + photoSize + documentsSize + musicSize + stickersCacheSize + storiesSize;
+        lastTotalSizeCalculatedAccount = currentAccount;
         lastTotalSizeCalculatedTime = System.currentTimeMillis();
         Arrays.fill(selected, true);
 
@@ -1574,10 +1590,11 @@ public class CacheControlActivity extends BaseFragment implements NotificationCe
     }
 
     private boolean pathContains(String path, int mediaDirType) {
-        if (path == null || FileLoader.checkDirectory(mediaDirType) == null) {
+        File directory = FileLoader.checkDirectory(currentAccount, mediaDirType);
+        if (path == null || directory == null) {
             return false;
         }
-        return path.contains(FileLoader.checkDirectory(mediaDirType).getAbsolutePath());
+        return path.contains(directory.getAbsolutePath());
     }
 
     @RequiresApi(api = Build.VERSION_CODES.R)
@@ -1592,9 +1609,10 @@ public class CacheControlActivity extends BaseFragment implements NotificationCe
         message.append(LocaleController.getString(R.string.LocalDatabaseClearText));
         message.append("\n\n");
         message.append(AndroidUtilities.replaceTags(formatString("LocalDatabaseClearText2", R.string.LocalDatabaseClearText2, AndroidUtilities.formatFileSize(databaseSize))));
+        message.append("\n\nAgram: это не очистка кэша. Очистка локальной базы может удалить сохранённые удалённые сообщения и их архивные медиа. Telegram не сможет восстановить уже удалённые на сервере сообщения. Для освобождения обычного кэша используйте «Очистить кэш».");
         builder.setMessage(message);
         builder.setNegativeButton(LocaleController.getString(R.string.Cancel), null);
-        builder.setPositiveButton(LocaleController.getString(R.string.CacheClear), (dialogInterface, i) -> {
+        builder.setPositiveButton(LocaleController.getString(R.string.ClearLocalDatabase), (dialogInterface, i) -> {
             if (getParentActivity() == null) {
                 return;
             }

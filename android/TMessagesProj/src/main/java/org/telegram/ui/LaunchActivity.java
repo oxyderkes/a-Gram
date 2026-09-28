@@ -70,6 +70,7 @@ import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.RelativeLayout;
+import android.widget.TextView;
 import android.widget.Toast;
 import android.window.BackEvent;
 import android.window.OnBackAnimationCallback;
@@ -179,6 +180,7 @@ import org.telegram.ui.Cells.ChatMessageCell;
 import org.telegram.ui.Cells.LanguageCell;
 import org.telegram.ui.Components.ActivityWindowEmptyBackgroundDrawable;
 import org.telegram.ui.Components.AlertsCreator;
+import org.telegram.ui.Components.AnimatedEmojiDrawable;
 import org.telegram.ui.Components.AppIconBulletinLayout;
 import org.telegram.ui.Components.AttachBotIntroTopView;
 import org.telegram.ui.Components.AudioPlayerAlert;
@@ -384,6 +386,17 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     };
 
     private FlagSecureReason flagSecureReason;
+    private static final long CONTAINER_UNLOCK_GRACE_MS = 60_000L;
+    private boolean containerUiLocked;
+    private int containerUnlockedAccount = -1;
+    private int containerPendingUnlockAccount = -1;
+    private long containerPausedAtElapsed;
+    private boolean containerUnlockInProgress;
+    private Runnable containerPendingUnlockAction;
+    private Runnable containerRelockRunnable;
+    private FrameLayout containerLockOverlay;
+    private TextView containerLockMessage;
+    private TextView containerLockAction;
     private final LiteMode.BatteryReceiver batteryReceiver = new LiteMode.BatteryReceiver();
     private WindowAnimatedInsetsProvider rootAnimatedInsetsListener;
 
@@ -421,6 +434,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         ApplicationLoader.postInitApplication();
         AndroidUtilities.checkDisplaySize(this, getResources().getConfiguration());
         currentAccount = UserConfig.selectedAccount;
+        containerUiLocked = shouldStartContainerLocked(currentAccount);
         registerReceiver(batteryReceiver, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
         if (!UserConfig.getInstance(currentAccount).isClientActivated()) {
             Intent intent = getIntent();
@@ -434,7 +448,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                     Uri uri = intent.getData();
                     if (uri != null) {
                         String url = uri.toString().toLowerCase();
-                        isProxy = url.startsWith("tg:proxy") || url.startsWith("tg://proxy") || url.startsWith("tg:socks") || url.startsWith("tg://socks");
+                        isProxy = url.startsWith("tg:proxy") || url.startsWith("tg://proxy")
+                                || url.startsWith("tg:webproxy") || url.startsWith("tg://webproxy")
+                                || url.startsWith("tg:socks") || url.startsWith("tg://socks");
                     }
                 }
             }
@@ -449,7 +465,8 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         getWindow().setBackgroundDrawable(new ActivityWindowEmptyBackgroundDrawable());
         getWindow().setFormat(PixelFormat.OPAQUE);
 
-        flagSecureReason = new FlagSecureReason(getWindow(), () -> SharedConfig.passcodeHash.length() > 0 && !SharedConfig.allowScreenCapture);
+        flagSecureReason = new FlagSecureReason(getWindow(), () -> containerUiLocked
+                || SharedConfig.passcodeHash.length() > 0 && !SharedConfig.allowScreenCapture);
         flagSecureReason.attach();
 
         super.onCreate(savedInstanceState);
@@ -561,6 +578,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         });
         actionBarLayout.setDelegate(this);
         Theme.loadWallpaper(true);
+        createContainerLockOverlay();
 
         checkCurrentAccount();
         updateCurrentConnectionState(currentAccount);
@@ -1213,41 +1231,130 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     }
 
     private void unlockContainerThen(int account, ContainerUnlockCallback onUnlocked) {
-        AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().ensureContainer(account);
-        if (!record.hasPin() && !record.biometricEnabled) {
-            onUnlocked.onUnlocked(account);
+        requestContainerUnlock(account, () -> onUnlocked.onUnlocked(account));
+    }
+
+    private boolean shouldStartContainerLocked(int account) {
+        if (!UserConfig.getInstance(account).isClientActivated()) {
+            return false;
+        }
+        try {
+            AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().ensureContainer(account);
+            return !record.isStorageAccessible() || record.hasPin() || record.biometricEnabled;
+        } catch (AgramContainerManager.ContainerPersistenceException e) {
+            FileLog.e("Unable to initialize Agram container protection", e);
+            return true;
+        }
+    }
+
+    private void requestContainerUnlock(int account, Runnable onUnlocked) {
+        if (!UserConfig.isValidAccount(account)) {
+            if (onUnlocked != null) {
+                onUnlocked.run();
+            }
             return;
         }
+        final AgramContainerManager.ContainerRecord record;
+        try {
+            record = AgramContainerManager.getInstance().ensureContainer(account);
+        } catch (AgramContainerManager.ContainerPersistenceException e) {
+            FileLog.e("Unable to load Agram container for unlock", e);
+            rememberContainerUnlock(account, onUnlocked);
+            showContainerLockOverlay(null, true);
+            return;
+        }
+        boolean protectedContainer = !record.isStorageAccessible() || record.hasPin() || record.biometricEnabled;
+        if (!protectedContainer) {
+            containerUnlockedAccount = account;
+            if (onUnlocked != null) {
+                onUnlocked.run();
+            }
+            return;
+        }
+        if (record.isStorageAccessible() && containerUnlockedAccount == account && !containerUiLocked) {
+            if (onUnlocked != null) {
+                onUnlocked.run();
+            }
+            return;
+        }
+        rememberContainerUnlock(account, onUnlocked);
+        showContainerLockOverlay(record, !record.isStorageAccessible());
+        if (!record.isStorageAccessible() || SharedConfig.isWaitingForPasscodeEnter
+                || AndroidUtilities.needShowPasscode(true)) {
+            return;
+        }
+        AndroidUtilities.runOnUIThread(() -> beginContainerUnlock(account));
+    }
+
+    private void rememberContainerUnlock(int account, Runnable onUnlocked) {
+        if (containerPendingUnlockAccount != account) {
+            containerPendingUnlockAction = null;
+        }
+        containerPendingUnlockAccount = account;
+        if (onUnlocked != null) {
+            containerPendingUnlockAction = onUnlocked;
+        }
+    }
+
+    private void beginContainerUnlock(int account) {
+        if (account < 0 || containerUnlockInProgress || isFinishing()
+                || account != containerPendingUnlockAccount) {
+            return;
+        }
+        AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(account);
+        if (record == null || !record.isStorageAccessible()) {
+            record = AgramContainerManager.getInstance().retryContainerAccess(account);
+        }
+        if (record == null || !record.isStorageAccessible()) {
+            showContainerLockOverlay(record, true);
+            return;
+        }
+        showContainerLockOverlay(record, false);
+        if (!record.hasPin() && !record.biometricEnabled) {
+            finishContainerUnlock(account, record.id);
+            return;
+        }
+        containerUnlockInProgress = true;
         if (record.biometricEnabled && BiometricManager.from(this).canAuthenticate(
                 BiometricManager.Authenticators.BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS) {
+            final AgramContainerManager.ContainerRecord unlockRecord = record;
             Executor executor = ContextCompat.getMainExecutor(this);
             BiometricPrompt prompt = new BiometricPrompt(this, executor, new BiometricPrompt.AuthenticationCallback() {
                 @Override
                 public void onAuthenticationSucceeded(@NonNull BiometricPrompt.AuthenticationResult result) {
-                    onUnlocked.onUnlocked(account);
+                    finishContainerUnlock(account, unlockRecord.id);
                 }
 
                 @Override
                 public void onAuthenticationError(int errorCode, @NonNull CharSequence errString) {
-                    if (record.hasPin()) {
-                        showContainerPinDialog(account, record, onUnlocked);
+                    containerUnlockInProgress = false;
+                    if (unlockRecord.hasPin()) {
+                        showContainerPinDialog(account, unlockRecord);
+                    } else {
+                        updateContainerLockMessage("Биометрическая проверка отменена. Данные контейнера остаются закрытыми.", "Повторить");
                     }
                 }
             });
             prompt.authenticate(new BiometricPrompt.PromptInfo.Builder()
-                    .setTitle(record.name)
+                    .setTitle("Защищённый контейнер")
                     .setSubtitle("Разблокировка изолированного контейнера")
                     .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
-                    .setNegativeButtonText(record.hasPin() ? "Использовать PIN" : LocaleController.getString(R.string.Cancel))
+                    .setNegativeButtonText(unlockRecord.hasPin() ? "Использовать PIN" : LocaleController.getString(R.string.Cancel))
                     .build());
         } else if (record.hasPin()) {
-            showContainerPinDialog(account, record, onUnlocked);
+            containerUnlockInProgress = false;
+            showContainerPinDialog(account, record);
         } else {
-            Toast.makeText(this, "Биометрия недоступна. Измените защиту контейнера в настройках.", Toast.LENGTH_LONG).show();
+            containerUnlockInProgress = false;
+            updateContainerLockMessage("Биометрия недоступна. Контейнер не был открыт.", "Повторить");
         }
     }
 
-    private void showContainerPinDialog(int account, AgramContainerManager.ContainerRecord record, ContainerUnlockCallback onUnlocked) {
+    private void showContainerPinDialog(int account, AgramContainerManager.ContainerRecord record) {
+        if (isFinishing() || account != containerPendingUnlockAccount) {
+            return;
+        }
+        containerUnlockInProgress = true;
         EditText input = new EditText(this);
         input.setSingleLine(true);
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
@@ -1258,16 +1365,255 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                 .setTitle(record.name)
                 .setMessage("Введите PIN изолированного контейнера")
                 .setView(input)
-                .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
-                .setPositiveButton(LocaleController.getString(R.string.OK), (dialog, which) -> {
-                    if (AgramContainerManager.getInstance().verifyPin(account, input.getText().toString())) {
-                        onUnlocked.onUnlocked(account);
+                .setNegativeButton(LocaleController.getString(R.string.Cancel), (dialog, which) -> {
+                    containerUnlockInProgress = false;
+                    if (account != currentAccount && UserConfig.isValidAccount(currentAccount)) {
+                        containerPendingUnlockAccount = -1;
+                        containerPendingUnlockAction = null;
+                        containerUnlockedAccount = currentAccount;
+                        hideContainerLockOverlay();
                     } else {
-                        Toast.makeText(this, "Неверный PIN", Toast.LENGTH_SHORT).show();
+                        updateContainerLockMessage(
+                                "Контейнер остаётся закрытым.",
+                                "Разблокировать");
                     }
+                })
+                .setPositiveButton(LocaleController.getString(R.string.OK), (dialog, which) -> {
+                    String candidate = input.getText().toString();
+                    input.setText("");
+                    AgramContainerManager.getInstance().verifyPinAsync(account, candidate, verified -> {
+                        containerUnlockInProgress = false;
+                        if (isFinishing() || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && isDestroyed())
+                                || account != containerPendingUnlockAccount) {
+                            return;
+                        }
+                        if (verified) {
+                            finishContainerUnlock(account, record.id);
+                        } else {
+                            updateContainerLockMessage("Неверный PIN. Контейнер не был открыт.", "Повторить");
+                            Toast.makeText(this, "Неверный PIN", Toast.LENGTH_SHORT).show();
+                        }
+                    });
                 })
                 .show();
         input.requestFocus();
+    }
+
+    private void finishContainerUnlock(int account, String expectedContainerId) {
+        AgramContainerManager.ContainerRecord current = AgramContainerManager.getInstance().getContainer(account);
+        if (current == null || !current.isStorageAccessible()
+                || !TextUtils.equals(expectedContainerId, current.id)) {
+            containerUnlockInProgress = false;
+            showContainerLockOverlay(current, true);
+            return;
+        }
+        containerUnlockInProgress = false;
+        containerUnlockedAccount = account;
+        containerPausedAtElapsed = 0;
+        hideContainerLockOverlay();
+        Runnable action = account == containerPendingUnlockAccount ? containerPendingUnlockAction : null;
+        containerPendingUnlockAccount = -1;
+        containerPendingUnlockAction = null;
+        if (action != null) {
+            action.run();
+        }
+    }
+
+    private void createContainerLockOverlay() {
+        containerLockOverlay = new FrameLayout(this);
+        containerLockOverlay.setBackgroundColor(Color.rgb(18, 18, 18));
+        containerLockOverlay.setClickable(true);
+        containerLockOverlay.setFocusable(true);
+        containerLockOverlay.setElevation(dp(32));
+
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setGravity(Gravity.CENTER_HORIZONTAL);
+        content.setPadding(dp(32), dp(24), dp(32), dp(24));
+        FrameLayout.LayoutParams contentParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER);
+        containerLockOverlay.addView(content, contentParams);
+
+        TextView title = new TextView(this);
+        title.setText("Защищённый контейнер");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(22);
+        title.setGravity(Gravity.CENTER);
+        content.addView(title, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        containerLockMessage = new TextView(this);
+        containerLockMessage.setTextColor(Color.LTGRAY);
+        containerLockMessage.setTextSize(16);
+        containerLockMessage.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams messageParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        messageParams.topMargin = dp(16);
+        content.addView(containerLockMessage, messageParams);
+
+        containerLockAction = new TextView(this);
+        containerLockAction.setTextColor(Color.rgb(100, 181, 246));
+        containerLockAction.setTextSize(17);
+        containerLockAction.setGravity(Gravity.CENTER);
+        containerLockAction.setClickable(true);
+        containerLockAction.setFocusable(true);
+        containerLockAction.setPadding(dp(24), dp(16), dp(24), dp(16));
+        containerLockAction.setOnClickListener(view -> beginContainerUnlock(containerPendingUnlockAccount));
+        LinearLayout.LayoutParams actionParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        actionParams.topMargin = dp(12);
+        content.addView(containerLockAction, actionParams);
+
+        frameLayout.addView(containerLockOverlay, LayoutHelper.createFrame(
+                LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
+        containerLockOverlay.setVisibility(containerUiLocked ? View.VISIBLE : View.GONE);
+        if (containerUiLocked) {
+            updateContainerLockMessage("Разблокируйте контейнер, чтобы продолжить.", "Разблокировать");
+            drawerLayoutContainer.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+        }
+    }
+
+    private void showContainerLockOverlay(AgramContainerManager.ContainerRecord record, boolean recovery) {
+        containerUiLocked = true;
+        if (containerLockOverlay != null) {
+            containerLockOverlay.setVisibility(View.VISIBLE);
+            containerLockOverlay.bringToFront();
+        }
+        if (drawerLayoutContainer != null) {
+            drawerLayoutContainer.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+        }
+        if (recovery || record == null || !record.isStorageAccessible()) {
+            updateContainerLockMessage("Локальный ключ временно недоступен. Сессия и файлы не удалены. Разблокируйте устройство и повторите.", "Повторить");
+        } else {
+            updateContainerLockMessage("Разблокируйте контейнер, чтобы продолжить.", "Разблокировать");
+        }
+        closeSensitiveContainerUi();
+        if (flagSecureReason != null) {
+            flagSecureReason.invalidate();
+        }
+    }
+
+    private void updateContainerLockMessage(String message, String action) {
+        if (containerLockMessage != null) {
+            containerLockMessage.setText(message);
+        }
+        if (containerLockAction != null) {
+            containerLockAction.setText(action);
+        }
+    }
+
+    private void hideContainerLockOverlay() {
+        containerUiLocked = false;
+        if (containerLockOverlay != null) {
+            containerLockOverlay.setVisibility(View.GONE);
+        }
+        if (drawerLayoutContainer != null) {
+            drawerLayoutContainer.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO);
+        }
+        if (flagSecureReason != null) {
+            flagSecureReason.invalidate();
+        }
+    }
+
+    private void closeSensitiveContainerUi() {
+        if (SecretMediaViewer.hasInstance() && SecretMediaViewer.getInstance().isVisible()) {
+            SecretMediaViewer.getInstance().closePhoto(false, false);
+        }
+        if (PhotoViewer.hasInstance() && PhotoViewer.getInstance().isVisible()) {
+            PhotoViewer.getInstance().closePhoto(false, true);
+        }
+        if (ArticleViewer.hasInstance() && ArticleViewer.getInstance().isVisible()) {
+            ArticleViewer.getInstance().close(false, true);
+        }
+        StoryRecorder.destroyInstance();
+        if (actionBarLayout != null) {
+            actionBarLayout.dismissDialogs();
+        }
+        if (AndroidUtilities.isTablet()) {
+            if (layersActionBarLayout != null) {
+                layersActionBarLayout.dismissDialogs();
+            }
+            if (rightActionBarLayout != null) {
+                rightActionBarLayout.dismissDialogs();
+            }
+        }
+    }
+
+    private void scheduleContainerRelock() {
+        if (containerRelockRunnable != null) {
+            AndroidUtilities.cancelRunOnUIThread(containerRelockRunnable);
+            containerRelockRunnable = null;
+        }
+        if (containerUiLocked || containerUnlockedAccount != currentAccount
+                || !UserConfig.isValidAccount(currentAccount)) {
+            return;
+        }
+        AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(currentAccount);
+        if (record == null || !record.isStorageAccessible()) {
+            containerUnlockedAccount = -1;
+            rememberContainerUnlock(currentAccount, null);
+            showContainerLockOverlay(record, true);
+            return;
+        }
+        if (!record.hasPin() && !record.biometricEnabled) {
+            return;
+        }
+        final int pausedAccount = currentAccount;
+        containerPausedAtElapsed = SystemClock.elapsedRealtime();
+        containerRelockRunnable = () -> {
+            containerRelockRunnable = null;
+            if (isResumed || currentAccount != pausedAccount
+                    || SystemClock.elapsedRealtime() - containerPausedAtElapsed < CONTAINER_UNLOCK_GRACE_MS) {
+                return;
+            }
+            containerUnlockedAccount = -1;
+            rememberContainerUnlock(pausedAccount, null);
+            AgramContainerManager.ContainerRecord current = AgramContainerManager.getInstance().getContainer(pausedAccount);
+            showContainerLockOverlay(current, current == null || !current.isStorageAccessible());
+        };
+        AndroidUtilities.runOnUIThread(containerRelockRunnable, CONTAINER_UNLOCK_GRACE_MS);
+    }
+
+    private void resumeContainerProtection() {
+        if (containerRelockRunnable != null) {
+            AndroidUtilities.cancelRunOnUIThread(containerRelockRunnable);
+            containerRelockRunnable = null;
+        }
+        if (!UserConfig.isValidAccount(currentAccount)) {
+            containerUnlockedAccount = -1;
+            containerPendingUnlockAccount = -1;
+            containerPendingUnlockAction = null;
+            containerPausedAtElapsed = 0;
+            hideContainerLockOverlay();
+            return;
+        }
+        final AgramContainerManager.ContainerRecord record;
+        try {
+            record = AgramContainerManager.getInstance().ensureContainer(currentAccount);
+        } catch (AgramContainerManager.ContainerPersistenceException e) {
+            FileLog.e("Unable to restore Agram container protection", e);
+            rememberContainerUnlock(currentAccount, null);
+            showContainerLockOverlay(null, true);
+            return;
+        }
+        boolean protectedContainer = !record.isStorageAccessible() || record.hasPin() || record.biometricEnabled;
+        if (!protectedContainer) {
+            containerUnlockedAccount = currentAccount;
+            containerPausedAtElapsed = 0;
+            hideContainerLockOverlay();
+            return;
+        }
+        boolean graceExpired = containerPausedAtElapsed != 0
+                && SystemClock.elapsedRealtime() - containerPausedAtElapsed >= CONTAINER_UNLOCK_GRACE_MS;
+        containerPausedAtElapsed = 0;
+        if (graceExpired) {
+            containerUnlockedAccount = -1;
+        }
+        if (containerUnlockedAccount != currentAccount || containerUiLocked) {
+            requestContainerUnlock(currentAccount, null);
+        }
     }
 
     private void performSwitchToAccount(int account, boolean removeAll, GenericProvider<Void, MainTabsActivity> dialogsActivityProvider) {
@@ -1278,9 +1624,27 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         try {
             ApplicationLoader.ensureAccountInitialized(account);
 
+            if (!UserConfig.setSelectedAccountPersisted(account)) {
+                NotificationCenter.getInstance(currentAccount).postNotificationName(
+                        NotificationCenter.agramContainerPersistenceFailed,
+                        account,
+                        "selected_account");
+                Toast.makeText(this, "Не удалось сохранить переключение аккаунта", Toast.LENGTH_LONG).show();
+                containerUnlockedAccount = -1;
+                requestContainerUnlock(currentAccount, null);
+                return;
+            }
             ConnectionsManager.getInstance(currentAccount).setAppPaused(true, false);
-            UserConfig.setSelectedAccountPersisted(account);
-            AgramContainerManager.getInstance().publishProxyForSelectedContainer(account);
+            try {
+                AgramContainerManager.getInstance().publishProxyForSelectedContainer(account);
+            } catch (AgramContainerManager.ContainerPersistenceException e) {
+                FileLog.e("Unable to publish selected Agram proxy settings", e);
+                NotificationCenter.getInstance(account).postNotificationName(
+                        NotificationCenter.agramContainerPersistenceFailed,
+                        account,
+                        "proxy_settings");
+                Toast.makeText(this, "Аккаунт переключён, но сетевые настройки могли сохраниться не полностью", Toast.LENGTH_LONG).show();
+            }
             AgramNetworkController.getInstance().apply(account);
 
         checkCurrentAccount();
@@ -1335,7 +1699,14 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             switchToAccount(account, true);
         } else {
             int loginAccount = UserConfig.getLoginTargetAccount();
-            UserConfig.setSelectedAccountPersisted(loginAccount);
+            if (!UserConfig.setSelectedAccountPersisted(loginAccount)) {
+                NotificationCenter.getInstance(loginAccount).postNotificationName(
+                        NotificationCenter.agramContainerPersistenceFailed,
+                        loginAccount,
+                        "selected_account");
+                Toast.makeText(this, "Не удалось сохранить выбор аккаунта", Toast.LENGTH_LONG).show();
+                return;
+            }
             currentAccount = loginAccount;
             RestrictedLanguagesSelectActivity.checkRestrictedLanguages(true);
             clearFragments();
@@ -1390,6 +1761,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             .add(NotificationCenter.mainUserInfoChanged)
             .add(NotificationCenter.attachMenuBotsDidLoad)
             .add(NotificationCenter.didUpdateConnectionState)
+            .add(NotificationCenter.agramContainerStorageStateChanged)
             .add(NotificationCenter.needShowAlert)
             .add(NotificationCenter.wasUnableToFindCurrentLocation)
             .add(NotificationCenter.openArticle)
@@ -1549,6 +1921,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         SharedConfig.isWaitingForPasscodeEnter = true;
         PasscodeView.PasscodeViewDelegate delegate = view -> {
             SharedConfig.isWaitingForPasscodeEnter = false;
+            if (containerUiLocked && containerPendingUnlockAccount >= 0) {
+                AndroidUtilities.runOnUIThread(() -> beginContainerUnlock(containerPendingUnlockAccount));
+            }
             if (passcodeSaveIntent != null) {
                 handleIntent(passcodeSaveIntent, passcodeSaveIntentIsNew, passcodeSaveIntentIsRestore, true, null, false, true);
                 passcodeSaveIntent = null;
@@ -1590,8 +1965,59 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         return handleIntent(intent, isNew, restore, fromPassword, null, true, false);
     }
 
-    @SuppressLint("Range")
+    private boolean deferIntentUntilContainerUnlock(Intent intent, boolean isNew, boolean restore,
+                                                    boolean fromPassword, Browser.Progress progress,
+                                                    boolean rebuildFragments, boolean openedTelegram) {
+        int account = intent == null
+                ? UserConfig.selectedAccount
+                : intent.getIntExtra("currentAccount", UserConfig.selectedAccount);
+        if (!UserConfig.isValidAccount(account)) {
+            return false;
+        }
+        boolean requiresUnlock;
+        try {
+            AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().ensureContainer(account);
+            boolean protectedContainer = !record.isStorageAccessible() || record.hasPin() || record.biometricEnabled;
+            if (!protectedContainer) {
+                containerUnlockedAccount = account;
+                if (account == UserConfig.selectedAccount && containerUiLocked) {
+                    hideContainerLockOverlay();
+                }
+                return false;
+            }
+            requiresUnlock = containerUnlockedAccount != account || containerUiLocked;
+        } catch (AgramContainerManager.ContainerPersistenceException e) {
+            FileLog.e("Unable to validate Agram container before handling intent", e);
+            requiresUnlock = true;
+        }
+        if (!requiresUnlock) {
+            return false;
+        }
+        Intent pendingIntent = intent == null ? null : new Intent(intent);
+        requestContainerUnlock(account, () -> handleIntent(
+                pendingIntent,
+                isNew,
+                restore,
+                fromPassword,
+                progress,
+                rebuildFragments,
+                openedTelegram,
+                true));
+        return true;
+    }
+
     private boolean handleIntent(Intent intent, boolean isNew, boolean restore, boolean fromPassword, Browser.Progress progress, boolean rebuildFragments, boolean openedTelegram) {
+        return handleIntent(intent, isNew, restore, fromPassword, progress, rebuildFragments, openedTelegram, false);
+    }
+
+    @SuppressLint("Range")
+    private boolean handleIntent(Intent intent, boolean isNew, boolean restore, boolean fromPassword,
+                                 Browser.Progress progress, boolean rebuildFragments,
+                                 boolean openedTelegram, boolean fromContainerUnlock) {
+        if (!fromContainerUnlock && deferIntentUntilContainerUnlock(
+                intent, isNew, restore, fromPassword, progress, rebuildFragments, openedTelegram)) {
+            return false;
+        }
         if (GiftInfoBottomSheet.handleIntent(intent, progress)) {
             return true;
         }
@@ -1802,7 +2228,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                                     if (exportingChatUri == null) {
                                         path = AndroidUtilities.getPath(uri);
                                         if (!BuildVars.NO_SCOPED_STORAGE) {
-                                            path = MediaController.copyFileToCache(uri, "file");
+                                            path = MediaController.copyFileToCache(currentAccount, uri, "file");
                                         }
                                         if (path != null) {
                                             if (path.startsWith("file:")) {
@@ -2901,7 +3327,8 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                                 req.hash = phoneHash;
                                 req.settings = new TLRPC.TL_codeSettings();
                                 req.settings.allow_flashcall = false;
-                                req.settings.allow_app_hash = req.settings.allow_firebase = PushListenerController.GooglePushListenerServiceProvider.INSTANCE.hasServices();
+                                req.settings.allow_app_hash = PushListenerController.GooglePushListenerServiceProvider.INSTANCE.hasServices();
+                                req.settings.allow_firebase = false;
                                 SharedPreferences preferences = ApplicationLoader.applicationContext.getSharedPreferences("mainconfig", Activity.MODE_PRIVATE);
                                 if (req.settings.allow_app_hash) {
                                     preferences.edit().putString("sms_hash", BuildVars.getSmsHash()).apply();
@@ -2988,7 +3415,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                             } else if (error != null) {
                                 if ("URL_EXPIRED".equalsIgnoreCase(error.text)) {
                                     OAuthSheet.getBulletinFactory()
-                                        .createSimpleBulletin(R.raw.error, getString(R.string.BotAuthLoggedInFailTitle), getString(R.string.BotAuthLoggedInFailNoDomain))
+                                        .createSimpleBulletin(R.raw.error, LocaleController.getString(R.string.BotAuthLoggedInFailTitle), LocaleController.getString(R.string.BotAuthLoggedInFailNoDomain))
                                         .show();
                                 } else {
                                     OAuthSheet.getBulletinFactory().showForError(error);
@@ -3437,7 +3864,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         final LoginActivity loginActivity = new LoginActivity().changeEmail(() -> {
             Bulletin.LottieLayout layout = new Bulletin.LottieLayout(this, null);
             layout.setAnimation(R.raw.email_check_inbox);
-            layout.textView.setText(getString(R.string.YourLoginEmailChangedSuccess));
+            layout.textView.setText(LocaleController.getString(R.string.YourLoginEmailChangedSuccess));
             int duration = Bulletin.DURATION_SHORT;
 
             BaseFragment fragment = getLastFragment();
@@ -3463,9 +3890,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
 
             new AlertDialog.Builder(this)
                     .setTitle(spannable)
-                    .setMessage(getString(R.string.EmailLoginChangeMessage))
-                    .setPositiveButton(getString(R.string.ChangeEmail), (dialog, which) -> presentFragment(loginActivity))
-                    .setNegativeButton(getString(R.string.Cancel), null)
+                    .setMessage(LocaleController.getString(R.string.EmailLoginChangeMessage))
+                    .setPositiveButton(LocaleController.getString(R.string.ChangeEmail), (dialog, which) -> presentFragment(loginActivity))
+                    .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
                     .show();
         } else {
             presentFragment(loginActivity);
@@ -4171,7 +4598,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             requestId[0] = GiftAuctionController.getInstance(currentAccount).requestGiftAuctionBySlug(stargiftPreviewSlug, (res, err) -> {
                 if (err != null) {
                     BulletinFactory.of(mainFragmentsStack.get(mainFragmentsStack.size() - 1))
-                            .createSimpleBulletin(R.raw.error, getString(R.string.GiftAuctionNotFound))
+                            .createSimpleBulletin(R.raw.error, LocaleController.getString(R.string.GiftAuctionNotFound))
                             .show();
                 } else if (res != null) {
                     GiftAuctionController.Auction auction = GiftAuctionController.getInstance(currentAccount).getAuction(res.gift.id);
@@ -4190,7 +4617,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             requestId[0] = GiftAuctionController.getInstance(currentAccount).requestGiftAuctionBySlug(auctionSlug, (res, err) -> {
                 if (err != null) {
                     BulletinFactory.of(mainFragmentsStack.get(mainFragmentsStack.size() - 1))
-                            .createSimpleBulletin(R.raw.error, getString(R.string.GiftAuctionNotFound))
+                            .createSimpleBulletin(R.raw.error, LocaleController.getString(R.string.GiftAuctionNotFound))
                             .show();
                 } else if (res != null) {
                     AuctionJoinSheet.show(LaunchActivity.this, null, currentAccount, 0, res.gift.id, null);
@@ -4211,11 +4638,11 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                     if (lastFragment == null) return;
                     if ("STARGIFT_ALREADY_BURNED".equalsIgnoreCase(error.text)) {
                         BulletinFactory.of(lastFragment)
-                            .createSimpleBulletin(R.raw.fire_on, getString(R.string.UniqueGiftNotFoundBurned))
+                            .createSimpleBulletin(R.raw.fire_on, LocaleController.getString(R.string.UniqueGiftNotFoundBurned))
                             .show();
                     } else {
                         BulletinFactory.of(lastFragment)
-                            .createSimpleBulletin(R.raw.error, getString(R.string.UniqueGiftNotFound))
+                            .createSimpleBulletin(R.raw.error, LocaleController.getString(R.string.UniqueGiftNotFound))
                             .show();
                     }
                 } else if (response instanceof TL_stars.TL_payments_uniqueStarGift) {
@@ -6167,9 +6594,8 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                         SharedPreferences preferences = MessagesController.getGlobalMainSettings();
                         SharedPreferences.Editor editor = MessagesController.getGlobalMainSettings().edit();
                         editor.putBoolean("proxy_enabled", false);
-                        editor.putBoolean("proxy_enabled_calls", false);
                         editor.commit();
-                        ConnectionsManager.setProxySettings(false, "", 1080, "", "", "");
+                        ConnectionsManager.setProxySettings(false, null);
                         NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxySettingsChanged);
                         proxyErrorDialog = null;
                     }
@@ -6232,7 +6658,9 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             try {
                 final Bitmap bitmap = SendMessagesHelper.createVideoThumbnail(videoPath, MediaStore.Video.Thumbnails.MINI_KIND);
                 final String fileName = Integer.MIN_VALUE + "_" + SharedConfig.getLastLocalId() + ".jpg";
-                File cacheFile = new File(FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE), fileName);
+                File mediaDirectory = FileLoader.getDirectory(dialogsFragment.getCurrentAccount(), FileLoader.MEDIA_DIR_CACHE);
+                if (mediaDirectory == null) return false;
+                File cacheFile = new File(mediaDirectory, fileName);
                 FileOutputStream stream = null;
                 try {
                     stream = new FileOutputStream(cacheFile);
@@ -6815,6 +7243,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     protected void onPause() {
         super.onPause();
         isResumed = false;
+        scheduleContainerRelock();
         pipActivityHandler.onPause();
         NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.stopAllHeavyOperations, 4096);
         ApplicationLoader.mainInterfacePaused = true;
@@ -6941,6 +7370,10 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     protected void onDestroy() {
         isActive = false;
         activeInstanceCount--;
+        if (containerRelockRunnable != null) {
+            AndroidUtilities.cancelRunOnUIThread(containerRelockRunnable);
+            containerRelockRunnable = null;
+        }
         unregisterReceiver(batteryReceiver);
 
         if (activeInstanceCount == 0) {
@@ -7028,6 +7461,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
             editorView.destroy();
         }
         FloatingDebugController.onDestroy();
+        AnimatedEmojiDrawable.dropGlobalEmojiCache();
         if (BuildConfig.DEBUG_PRIVATE_VERSION) {
             LeakDetector.getInstance().stop();
         }
@@ -7050,6 +7484,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     protected void onResume() {
         super.onResume();
         isResumed = true;
+        resumeContainerProtection();
         pipActivityHandler.onResume();
         if (onResumeStaticCallback != null) {
             onResumeStaticCallback.run();
@@ -7265,6 +7700,15 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                 }
                 currentConnectionState = state;
                 updateCurrentConnectionState(account);
+            }
+        } else if (id == NotificationCenter.agramContainerStorageStateChanged && account == currentAccount) {
+            AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(account);
+            if (record == null || !record.isStorageAccessible()) {
+                containerUnlockedAccount = -1;
+                rememberContainerUnlock(account, null);
+                showContainerLockOverlay(record, true);
+            } else if (containerUiLocked && isResumed) {
+                requestContainerUnlock(account, null);
             }
         } else if (id == NotificationCenter.mainUserInfoChanged) {
 
@@ -7784,10 +8228,10 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                 AlertDialog.Builder builder = new AlertDialog.Builder(this, null);
                 builder.setTitle("TL Error");
                 builder.setMessage(messageToShow);
-                builder.setNegativeButton(getString(R.string.Copy), (d, i) -> {
+                builder.setNegativeButton(LocaleController.getString(R.string.Copy), (d, i) -> {
                     AndroidUtilities.addToClipboard(messageToCopy);
                 });
-                builder.setPositiveButton(getString(R.string.OK), null);
+                builder.setPositiveButton(LocaleController.getString(R.string.OK), null);
                 builder.setOnDismissListener(d -> {
                     AndroidUtilities.runOnUIThread(() -> {
                         tlErrorAlertDialog = null;
@@ -7812,7 +8256,7 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
                 AlertDialog.Builder builder = new AlertDialog.Builder(this, null);
                 builder.setTitle("Memory Leak Found");
                 builder.setMessage(messageToShow);
-                builder.setPositiveButton(getString(R.string.OK), null);
+                builder.setPositiveButton(LocaleController.getString(R.string.OK), null);
                 builder.setOnDismissListener(d -> {
                     AndroidUtilities.runOnUIThread(() -> {
                         memoryLeakErrorAlertDialog = null;
@@ -8294,6 +8738,14 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
         if (currentConnectionState == ConnectionsManager.ConnectionStateWaitingForNetwork) {
             title = "WaitingForNetwork";
             titleId = R.string.WaitingForNetwork;
+        } else if (currentConnectionState == ConnectionsManager.ConnectionStateLocalAuthUnavailable) {
+            title = "AGramLocalSessionUnavailable";
+            titleId = R.string.AGramLocalSessionUnavailable;
+            action = () -> new AlertDialog.Builder(this)
+                    .setTitle(LocaleController.getString(R.string.AGramLocalSessionUnavailable))
+                    .setMessage(LocaleController.getString(R.string.AGramLocalSessionUnavailableInfo))
+                    .setPositiveButton(LocaleController.getString(R.string.OK), null)
+                    .show();
         } else if (currentConnectionState == ConnectionsManager.ConnectionStateUpdating) {
             title = "Updating";
             titleId = R.string.Updating;
@@ -8406,6 +8858,12 @@ public class LaunchActivity extends BasePermissionsActivity implements INavigati
     }
 
     public boolean onBackPressed(boolean invoked) {
+        if (containerUiLocked) {
+            if (invoked) {
+                finish();
+            }
+            return false;
+        }
         if (FloatingDebugController.onBackPressed(invoked)) {
             return false;
         }

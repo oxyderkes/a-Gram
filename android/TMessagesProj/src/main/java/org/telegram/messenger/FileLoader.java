@@ -18,13 +18,22 @@ import org.telegram.tgnet.tl.TL_stories;
 import org.telegram.ui.LaunchActivity;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.regex.Matcher;
@@ -223,7 +232,22 @@ public class FileLoader extends BaseController {
 
     private String forceLoadingFile;
 
-    private static SparseArray<File> mediaDirs = null;
+    private static final Object mediaDirsLock = new Object();
+    /**
+     * Legacy/global roots. These are retained for process-wide assets which do not belong to an
+     * account and as read-only migration sources. Account media must use the two-argument APIs.
+     */
+    private static SparseArray<File> mediaDirs = new SparseArray<>();
+    private static final SparseArray<AccountMediaDirs> accountMediaDirs = new SparseArray<>();
+    private static final SparseArray<String> unavailableMediaScopes = new SparseArray<>();
+    private static final Set<String> scheduledLegacyMigrations = new HashSet<>();
+    private static final Set<String> invalidatedMediaContainers = new HashSet<>();
+    private static final String SCOPED_CACHE_DIRECTORY = "agram_containers";
+    private static final String SCOPED_MEDIA_DIRECTORY = "Agram Containers";
+    private static final String LEGACY_COPY_DIRECTORY = ".legacy_v1";
+    private static final String QUARANTINE_DIRECTORY = "agram_unavailable";
+    private static final int LEGACY_MIGRATION_BUFFER_SIZE = 256 * 1024;
+    private static final long LEGACY_MIGRATION_FREE_RESERVE = 64L * 1024L * 1024L;
     private FileLoaderDelegate delegate = null;
 
     private int lastReferenceId;
@@ -255,28 +279,508 @@ public class FileLoader extends BaseController {
     }
 
     public static void setMediaDirs(SparseArray<File> dirs) {
-        mediaDirs = dirs;
-    }
-
-    public static File checkDirectory(int type) {
-        return mediaDirs.get(type);
-    }
-
-    public static File getDirectory(int type) {
-        File dir = mediaDirs.get(type);
-        if (dir == null && type != FileLoader.MEDIA_DIR_CACHE) {
-            dir = mediaDirs.get(FileLoader.MEDIA_DIR_CACHE);
+        synchronized (mediaDirsLock) {
+            mediaDirs = copyMediaDirs(dirs);
+            // A removable-storage change can replace every base root. Rebuild UUID-scoped
+            // snapshots lazily; in-flight operations already own their concrete File objects.
+            accountMediaDirs.clear();
         }
-        if (BuildVars.NO_SCOPED_STORAGE) {
-            try {
-                if (dir != null && !dir.isDirectory()) {
-                    dir.mkdirs();
-                }
-            } catch (Exception e) {
-                //don't prompt
+    }
+
+    /** Legacy/global directory. Do not use this for account-owned payloads. */
+    public static File checkDirectory(int type) {
+        synchronized (mediaDirsLock) {
+            return mediaDirs.get(type);
+        }
+    }
+
+    /** Legacy/global directory. Do not use this for account-owned payloads. */
+    public static File getDirectory(int type) {
+        File dir;
+        synchronized (mediaDirsLock) {
+            dir = mediaDirs.get(type);
+            if (dir == null && type != FileLoader.MEDIA_DIR_CACHE) {
+                dir = mediaDirs.get(FileLoader.MEDIA_DIR_CACHE);
             }
         }
+        ensureDirectory(dir);
         return dir;
+    }
+
+    /** Returns a directory bound to the exact UUID currently mapped to {@code account}. */
+    public static File checkDirectory(int account, int type) {
+        AccountMediaDirs scoped = getAccountMediaDirs(account);
+        return scoped == null ? null : scoped.directories.get(type);
+    }
+
+    /**
+     * Account-safe media root. Non-public types fall back only to this container's cache, never
+     * to a shared directory or another account's snapshot.
+     */
+    public static File getDirectory(int account, int type) {
+        AccountMediaDirs scoped = getAccountMediaDirs(account);
+        if (scoped == null) {
+            // Fail closed into a process-ephemeral, account-separated cache root.  This is never
+            // consulted once a real container UUID becomes available, so callers cannot fall
+            // through to a relative path or another account's media while startup/logout races.
+            return getQuarantineDirectory(account, type);
+        }
+        File dir = scoped.directories.get(type);
+        if (dir == null && type != MEDIA_DIR_CACHE
+                && type != MEDIA_DIR_IMAGE_PUBLIC && type != MEDIA_DIR_VIDEO_PUBLIC) {
+            dir = scoped.directories.get(MEDIA_DIR_CACHE);
+        }
+        ensureDirectory(dir);
+        return dir;
+    }
+
+    public File getDirectoryForCurrentAccount(int type) {
+        return getDirectory(currentAccount, type);
+    }
+
+    /** Stable in-memory/disk-cache namespace for the current UUID mapping. */
+    public static String getMediaScope(int account) {
+        AgramContainerManager.ContainerRecord record = getContainerRecord(account);
+        return record == null ? getUnavailableMediaScope(account) : record.id;
+    }
+
+    /**
+     * Snapshot used by cache maintenance. It includes every currently mapped container plus the
+     * legacy root, and never infers an account from the selected UI account.
+     */
+    public static List<File> getAllDirectories(int type) {
+        ArrayList<File> result = new ArrayList<>();
+        HashSet<String> seen = new HashSet<>();
+        File legacy = checkDirectory(type);
+        addUniqueDirectory(result, seen, legacy);
+        for (int account = 0; account < UserConfig.MAX_ACCOUNT_COUNT; account++) {
+            AgramContainerManager.ContainerRecord record = getContainerRecord(account);
+            if (record == null) {
+                continue;
+            }
+            addUniqueDirectory(result, seen, getDirectory(account, type));
+        }
+        return result;
+    }
+
+    /** True for legacy or UUID-scoped FileLoader roots, without scanning their contents. */
+    public static boolean isManagedMediaPath(String path) {
+        String canonical = canonicalPath(path == null ? null : new File(path));
+        if (canonical == null) {
+            return false;
+        }
+        synchronized (mediaDirsLock) {
+            if (isBelowAnyDirectory(canonical, mediaDirs)) {
+                return true;
+            }
+            for (int i = 0; i < accountMediaDirs.size(); i++) {
+                if (isBelowAnyDirectory(canonical, accountMediaDirs.valueAt(i).directories)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Invalidates cached paths immediately when an account-to-container mapping is retired. */
+    public static void onContainerPurged(int account, String containerId) {
+        synchronized (mediaDirsLock) {
+            invalidatedMediaContainers.add(account + ":" + containerId);
+            AccountMediaDirs current = accountMediaDirs.get(account);
+            if (current != null && TextUtils.equals(current.containerId, containerId)) {
+                accountMediaDirs.remove(account);
+            }
+            unavailableMediaScopes.remove(account);
+            scheduledLegacyMigrations.removeIf(key -> key.startsWith(account + ":" + containerId + ":"));
+        }
+    }
+
+    private static AccountMediaDirs getAccountMediaDirs(int account) {
+        if (account < 0 || account >= UserConfig.MAX_ACCOUNT_COUNT
+                || ApplicationLoader.applicationContext == null) {
+            return null;
+        }
+        AgramContainerManager.ContainerRecord record = getContainerRecord(account);
+        if (record == null) {
+            return null;
+        }
+        synchronized (mediaDirsLock) {
+            if (invalidatedMediaContainers.contains(account + ":" + record.id)) {
+                return null;
+            }
+            AccountMediaDirs cached = accountMediaDirs.get(account);
+            if (cached != null && TextUtils.equals(cached.containerId, record.id)) {
+                return cached;
+            }
+            SparseArray<File> scoped = buildScopedMediaDirs(record.id, mediaDirs);
+            if (scoped == null) {
+                return null;
+            }
+            AccountMediaDirs created = new AccountMediaDirs(record.id, scoped);
+            accountMediaDirs.put(account, created);
+            return created;
+        }
+    }
+
+    private static AgramContainerManager.ContainerRecord getContainerRecord(int account) {
+        try {
+            AgramContainerManager.ContainerRecord record = AgramContainerManager.getInstance().getContainer(account);
+            return record != null && record.isStorageAccessible() && isStrictUuid(record.id)
+                    ? record : null;
+        } catch (Throwable e) {
+            FileLog.e("Unable to resolve Agram media container for account " + account, e);
+            return null;
+        }
+    }
+
+    private static String getUnavailableMediaScope(int account) {
+        synchronized (mediaDirsLock) {
+            String scope = unavailableMediaScopes.get(account);
+            if (scope == null) {
+                scope = "unavailable-" + account + "-" + UUID.randomUUID();
+                unavailableMediaScopes.put(account, scope);
+            }
+            return scope;
+        }
+    }
+
+    private static File getQuarantineDirectory(int account, int type) {
+        File cache = ApplicationLoader.applicationContext == null
+                ? null : ApplicationLoader.applicationContext.getCacheDir();
+        if (cache == null) {
+            // Absolute unwritable sentinel: safer than Java's new File(null, child), which silently
+            // creates a relative path when Android startup has not installed the app context yet.
+            cache = new File("/dev/null/agram-unavailable");
+        }
+        String leaf = type >= 0 ? Integer.toString(type) : "unknown";
+        File directory = new File(new File(new File(cache, QUARANTINE_DIRECTORY),
+                getUnavailableMediaScope(account)), leaf);
+        ensureDirectory(directory);
+        return directory;
+    }
+
+    private static SparseArray<File> buildScopedMediaDirs(String containerId, SparseArray<File> bases) {
+        if (!isStrictUuid(containerId)) {
+            return null;
+        }
+        SparseArray<File> result = new SparseArray<>();
+        File cacheBase = bases == null ? null : bases.get(MEDIA_DIR_CACHE);
+        if (cacheBase == null) {
+            cacheBase = AndroidUtilities.getCacheDir();
+        }
+        File scopedCache = validatedScopedChild(cacheBase, SCOPED_CACHE_DIRECTORY, containerId);
+        if (scopedCache == null) {
+            return null;
+        }
+        result.put(MEDIA_DIR_CACHE, scopedCache);
+        int[] types = {
+                MEDIA_DIR_IMAGE, MEDIA_DIR_AUDIO, MEDIA_DIR_VIDEO, MEDIA_DIR_DOCUMENT,
+                MEDIA_DIR_FILES, MEDIA_DIR_STORIES, MEDIA_DIR_IMAGE_PUBLIC,
+                MEDIA_DIR_VIDEO_PUBLIC
+        };
+        for (int type : types) {
+            File base = bases == null ? null : bases.get(type);
+            if (base == null) {
+                continue;
+            }
+            File scoped = validatedScopedChild(base, SCOPED_MEDIA_DIRECTORY, containerId);
+            if (scoped != null) {
+                result.put(type, scoped);
+            }
+        }
+        return result;
+    }
+
+    private static File validatedScopedChild(File base, String namespace, String containerId) {
+        if (base == null || !isStrictUuid(containerId)) {
+            return null;
+        }
+        try {
+            File canonicalBase = base.getCanonicalFile();
+            File namespaceRoot = new File(canonicalBase, namespace).getCanonicalFile();
+            File child = new File(namespaceRoot, containerId).getCanonicalFile();
+            if (!namespaceRoot.equals(child.getParentFile())) {
+                return null;
+            }
+            return child;
+        } catch (IOException e) {
+            FileLog.e("Unable to resolve UUID-scoped media directory", e);
+            return null;
+        }
+    }
+
+    private static SparseArray<File> copyMediaDirs(SparseArray<File> source) {
+        SparseArray<File> copy = new SparseArray<>();
+        if (source != null) {
+            for (int i = 0; i < source.size(); i++) {
+                copy.put(source.keyAt(i), source.valueAt(i));
+            }
+        }
+        return copy;
+    }
+
+    private static void ensureDirectory(File dir) {
+        try {
+            if (dir != null && !dir.isDirectory()) {
+                dir.mkdirs();
+            }
+        } catch (Throwable e) {
+            FileLog.e("Unable to create media directory " + dir, e);
+        }
+    }
+
+    private static void addUniqueDirectory(ArrayList<File> result, Set<String> seen, File directory) {
+        String path = canonicalPath(directory);
+        if (path != null && seen.add(path)) {
+            result.add(directory);
+        }
+    }
+
+    private static boolean isBelowAnyDirectory(String canonicalPath, SparseArray<File> directories) {
+        if (directories == null) {
+            return false;
+        }
+        for (int i = 0; i < directories.size(); i++) {
+            String root = canonicalPath(directories.valueAt(i));
+            if (root != null && (canonicalPath.equals(root)
+                    || canonicalPath.startsWith(root + File.separator))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String canonicalPath(File file) {
+        if (file == null || TextUtils.isEmpty(file.getPath())) {
+            return null;
+        }
+        try {
+            return file.getCanonicalPath();
+        } catch (IOException e) {
+            return file.getAbsolutePath();
+        }
+    }
+
+    private static boolean isStrictUuid(String value) {
+        if (TextUtils.isEmpty(value)) {
+            return false;
+        }
+        try {
+            return UUID.fromString(value).toString().equals(value.toLowerCase(Locale.US));
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    private static final class AccountMediaDirs {
+        final String containerId;
+        final SparseArray<File> directories;
+
+        AccountMediaDirs(String containerId, SparseArray<File> directories) {
+            this.containerId = containerId;
+            this.directories = directories;
+        }
+    }
+
+    /**
+     * A FilePathDatabase row is account-local proof that a legacy shared path was referenced by
+     * this account. Copy it lazily into a document-keyed directory; never move or delete the
+     * shared source because another account may still reference the same inode.
+     */
+    private File resolveDatabasePathForRead(long documentId, int dcId, int type, String path) {
+        if (TextUtils.isEmpty(path)) {
+            return null;
+        }
+        File source = new File(path);
+        String sourcePath = canonicalPath(source);
+        if (sourcePath == null) {
+            return source;
+        }
+        AccountMediaDirs scoped = getAccountMediaDirs(currentAccount);
+        if (scoped == null) {
+            return source;
+        }
+        if (isBelowAnyDirectory(sourcePath, scoped.directories)) {
+            return source;
+        }
+        File targetRoot = scoped.directories.get(type);
+        if (targetRoot == null) {
+            targetRoot = scoped.directories.get(MEDIA_DIR_CACHE);
+        }
+        if (targetRoot == null) {
+            return source;
+        }
+        if (isInsideAnyScopedNamespace(sourcePath)) {
+            // A stale/corrupt DB row points at a different UUID. Never cross that boundary.
+            File isolated = getLegacyMigrationDestination(
+                    targetRoot, documentId, dcId, type, source.getName());
+            return isolated == null ? new File(targetRoot, source.getName()) : isolated;
+        }
+        if (!isLegacyManagedPath(sourcePath) || !source.isFile() || !source.canRead()) {
+            // Explicit user paths outside FileLoader's managed roots remain valid local sources.
+            return source;
+        }
+        File destination = getLegacyMigrationDestination(
+                targetRoot, documentId, dcId, type, source.getName());
+        if (destination == null) {
+            return source;
+        }
+        long sourceLength = source.length();
+        if (sourceLength > 0 && destination.isFile() && destination.length() == sourceLength) {
+            return destination;
+        }
+        scheduleLegacyCopy(scoped.containerId, documentId, dcId, type, source, destination,
+                sourceLength);
+        return source;
+    }
+
+    private void scheduleLegacyCopy(String containerId, long documentId, int dcId, int type,
+                                    File source, File destination, long expectedLength) {
+        if (expectedLength <= 0) {
+            return;
+        }
+        String sourcePath = canonicalPath(source);
+        String destinationPath = canonicalPath(destination);
+        if (sourcePath == null || destinationPath == null) {
+            return;
+        }
+        String migrationKey = currentAccount + ":" + containerId + ":"
+                + documentId + ":" + dcId + ":" + type + ":" + sourcePath;
+        synchronized (mediaDirsLock) {
+            if (!scheduledLegacyMigrations.add(migrationKey)) {
+                return;
+            }
+        }
+        fileLoaderQueue.postRunnable(() -> {
+            try {
+                copyLegacyFile(containerId, source, destination, expectedLength);
+            } finally {
+                synchronized (mediaDirsLock) {
+                    scheduledLegacyMigrations.remove(migrationKey);
+                }
+            }
+        });
+    }
+
+    private void copyLegacyFile(String containerId, File source, File destination,
+                                long expectedLength) {
+        AgramContainerManager.ContainerRecord current = getContainerRecord(currentAccount);
+        if (current == null || !TextUtils.equals(containerId, current.id)
+                || !source.isFile() || source.length() != expectedLength) {
+            return;
+        }
+        if (destination.isFile()) {
+            return;
+        }
+        File parent = destination.getParentFile();
+        if (parent == null || (!parent.isDirectory() && !parent.mkdirs())) {
+            return;
+        }
+        long usable = parent.getUsableSpace();
+        if (usable > 0 && (expectedLength > Long.MAX_VALUE - LEGACY_MIGRATION_FREE_RESERVE
+                || usable < expectedLength + LEGACY_MIGRATION_FREE_RESERVE)) {
+            FileLog.e("Not enough space to isolate legacy media for account " + currentAccount);
+            return;
+        }
+        File temporary = new File(parent, ".agram-migrate-" + UUID.randomUUID() + ".tmp");
+        try {
+            long copied = 0;
+            byte[] buffer = new byte[LEGACY_MIGRATION_BUFFER_SIZE];
+            try (FileInputStream input = new FileInputStream(source);
+                 FileOutputStream output = new FileOutputStream(temporary)) {
+                int read;
+                while ((read = input.read(buffer)) != -1) {
+                    output.write(buffer, 0, read);
+                    copied += read;
+                }
+                output.flush();
+                output.getFD().sync();
+            }
+            current = getContainerRecord(currentAccount);
+            if (copied != expectedLength || source.length() != expectedLength
+                    || current == null || !TextUtils.equals(containerId, current.id)) {
+                return;
+            }
+            moveFileAtomically(temporary, destination);
+            try (FileOutputStream output = new FileOutputStream(destination, true)) {
+                output.getFD().sync();
+            }
+            current = getContainerRecord(currentAccount);
+            if (current == null || !TextUtils.equals(containerId, current.id)) {
+                destination.delete();
+            }
+        } catch (Throwable e) {
+            FileLog.e("Unable to isolate legacy media for account " + currentAccount, e);
+        } finally {
+            if (temporary.exists() && !temporary.delete()) {
+                FileLog.e("Unable to remove incomplete legacy media copy " + temporary);
+            }
+        }
+    }
+
+    private static File getLegacyMigrationDestination(File root, long documentId, int dcId,
+                                                       int type, String sourceName) {
+        String leaf = sourceName == null ? "media" : sourceName.replaceAll("[^A-Za-z0-9._-]", "_");
+        while (leaf.startsWith(".")) {
+            leaf = leaf.substring(1);
+        }
+        if (TextUtils.isEmpty(leaf)) {
+            leaf = "media";
+        }
+        try {
+            File canonicalRoot = root.getCanonicalFile();
+            File keyDirectory = new File(new File(canonicalRoot, LEGACY_COPY_DIRECTORY),
+                    "d_" + Long.toUnsignedString(documentId, 16) + "_"
+                            + Integer.toUnsignedString(dcId, 16) + "_" + type).getCanonicalFile();
+            File result = new File(keyDirectory, leaf).getCanonicalFile();
+            String prefix = canonicalRoot.getPath() + File.separator;
+            return result.getPath().startsWith(prefix) ? result : null;
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private static boolean isLegacyManagedPath(String canonical) {
+        synchronized (mediaDirsLock) {
+            for (int i = 0; i < mediaDirs.size(); i++) {
+                File base = mediaDirs.valueAt(i);
+                String root = canonicalPath(base);
+                if (root != null && (canonical.equals(root)
+                        || canonical.startsWith(root + File.separator))) {
+                    return !isInsideScopedNamespace(canonical, base);
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isInsideAnyScopedNamespace(String canonical) {
+        synchronized (mediaDirsLock) {
+            for (int i = 0; i < mediaDirs.size(); i++) {
+                if (isInsideScopedNamespace(canonical, mediaDirs.valueAt(i))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isInsideScopedNamespace(String canonical, File base) {
+        String root = canonicalPath(base);
+        if (root == null) {
+            return false;
+        }
+        String cachePrefix = root + File.separator + SCOPED_CACHE_DIRECTORY + File.separator;
+        String mediaPrefix = root + File.separator + SCOPED_MEDIA_DIRECTORY + File.separator;
+        return canonical.startsWith(cachePrefix) || canonical.startsWith(mediaPrefix);
+    }
+
+    private static void moveFileAtomically(File source, File destination) throws IOException {
+        try {
+            Files.move(source.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(source.toPath(), destination.toPath());
+        }
     }
 
     public int getFileReference(Object parentObject) {
@@ -776,16 +1280,16 @@ public class FileLoader extends BaseController {
         if (fileName == null) return null;
         File f;
 
-        f = new File(getDirectory(MEDIA_DIR_CACHE), fileName);
+        f = new File(getDirectory(currentAccount, MEDIA_DIR_CACHE), fileName);
         if (f.exists()) return f;
 
-        f = new File(getDirectory(MEDIA_DIR_IMAGE), fileName);
+        f = new File(getDirectory(currentAccount, MEDIA_DIR_IMAGE), fileName);
         if (f.exists()) return f;
 
-        f = new File(getDirectory(MEDIA_DIR_VIDEO), fileName);
+        f = new File(getDirectory(currentAccount, MEDIA_DIR_VIDEO), fileName);
         if (f.exists()) return f;
 
-        f = new File(getDirectory(MEDIA_DIR_FILES), fileName);
+        f = new File(getDirectory(currentAccount, MEDIA_DIR_FILES), fileName);
         if (f.exists()) return f;
 
         return null;
@@ -885,7 +1389,7 @@ public class FileLoader extends BaseController {
             return operation;
         }
 
-        File tempDir = getDirectory(MEDIA_DIR_CACHE);
+        File tempDir = getDirectory(currentAccount, MEDIA_DIR_CACHE);
         File storeDir = tempDir;
         int type = MEDIA_DIR_CACHE;
         long documentId = 0;
@@ -947,8 +1451,11 @@ public class FileLoader extends BaseController {
                 String path = getFileDatabase().getPath(documentId, dcId, type, true);
                 boolean customPath = false;
                 if (path != null) {
-                    File file = new File(path);
-                    if (file.exists()) {
+                    File file = resolveDatabasePathForRead(documentId, dcId, type, path);
+                    String resolvedPath = canonicalPath(file);
+                    // A legacy common file may be read while its proven account-owned copy is
+                    // queued, but a new download must never write back into the common root.
+                    if (file != null && file.exists() && !isLegacyManagedPath(resolvedPath)) {
                         customPath = true;
                         storeFileName = file.getName();
                         storeDir = file.getParentFile();
@@ -956,11 +1463,11 @@ public class FileLoader extends BaseController {
                 }
                 if (!customPath) {
                     storeFileName = fileName;
-                    storeDir = getDirectory(type);
+                    storeDir = getDirectory(currentAccount, type);
                     boolean saveCustomPath = false;
 
                     if (isStory) {
-                        File newDir = getDirectory(MEDIA_DIR_STORIES);
+                        File newDir = getDirectory(currentAccount, MEDIA_DIR_STORIES);
                         if (newDir != null) {
                             storeDir = newDir;
                             saveCustomPath = true;
@@ -968,9 +1475,9 @@ public class FileLoader extends BaseController {
                     } else if ((type == MEDIA_DIR_IMAGE || type == MEDIA_DIR_VIDEO) && canSaveToPublicStorage(parentObject)) {
                         File newDir;
                         if (type == MEDIA_DIR_IMAGE) {
-                            newDir = getDirectory(MEDIA_DIR_IMAGE_PUBLIC);
+                            newDir = getDirectory(currentAccount, MEDIA_DIR_IMAGE_PUBLIC);
                         } else {
-                            newDir = getDirectory(MEDIA_DIR_VIDEO_PUBLIC);
+                            newDir = getDirectory(currentAccount, MEDIA_DIR_VIDEO_PUBLIC);
                         }
                         if (newDir != null) {
                             storeDir = newDir;
@@ -978,7 +1485,7 @@ public class FileLoader extends BaseController {
                         }
                     } else if (!TextUtils.isEmpty(getDocumentFileName(document)) && canSaveAsFile(parentObject)) {
                         storeFileName = getDocumentFileName(document);
-                        File newDir = getDirectory(MEDIA_DIR_FILES);
+                        File newDir = getDirectory(currentAccount, MEDIA_DIR_FILES);
                         if (newDir != null) {
                             storeDir = newDir;
                             saveCustomPath = true;
@@ -990,7 +1497,7 @@ public class FileLoader extends BaseController {
                     }
                 }
             } else {
-                storeDir = getDirectory(type);
+                storeDir = getDirectory(currentAccount, type);
             }
         } else if (cacheType == ImageLoader.CACHE_TYPE_ENCRYPTED) {
             operation.setEncryptFile(true);
@@ -1438,7 +1945,7 @@ public class FileLoader extends BaseController {
         int dcId = 0;
         int type = 0;
         if (forceCache) {
-            dir = getDirectory(MEDIA_DIR_CACHE);
+            dir = getDirectory(currentAccount, MEDIA_DIR_CACHE);
         } else {
             if (attach instanceof TLRPC.Document) {
                 TLRPC.Document document = (TLRPC.Document) attach;
@@ -1458,7 +1965,7 @@ public class FileLoader extends BaseController {
                 }
                 documentId = document.id;
                 dcId = document.dc_id;
-                dir = getDirectory(type);
+                dir = getDirectory(currentAccount, type);
             } else if (attach instanceof TLRPC.Photo) {
                 TLRPC.PhotoSize photoSize = getClosestPhotoSizeWithSize(((TLRPC.Photo) attach).sizes, AndroidUtilities.getPhotoSize(true));
                 return getPathToAttach(photoSize, ext, false, useFileDatabaseQueue);
@@ -1467,52 +1974,52 @@ public class FileLoader extends BaseController {
                 if (photoSize instanceof TLRPC.TL_photoStrippedSize || photoSize instanceof TLRPC.TL_photoPathSize) {
                     dir = null;
                 } else if (photoSize.location == null || photoSize.location.key != null || photoSize.location.volume_id == Integer.MIN_VALUE && photoSize.location.local_id < 0 || photoSize.size < 0) {
-                    dir = getDirectory(type = MEDIA_DIR_CACHE);
+                    dir = getDirectory(currentAccount, type = MEDIA_DIR_CACHE);
                 } else {
-                    dir = getDirectory(type = MEDIA_DIR_IMAGE);
+                    dir = getDirectory(currentAccount, type = MEDIA_DIR_IMAGE);
                 }
                 documentId = photoSize.location.volume_id;
                 dcId = photoSize.location.dc_id + (photoSize.location.local_id << 16);
             } else if (attach instanceof TLRPC.TL_videoSize) {
                 TLRPC.TL_videoSize videoSize = (TLRPC.TL_videoSize) attach;
                 if (videoSize.location == null || videoSize.location.key != null || videoSize.location.volume_id == Integer.MIN_VALUE && videoSize.location.local_id < 0 || videoSize.size < 0) {
-                    dir = getDirectory(type = MEDIA_DIR_CACHE);
+                    dir = getDirectory(currentAccount, type = MEDIA_DIR_CACHE);
                 } else {
-                    dir = getDirectory(type = MEDIA_DIR_IMAGE);
+                    dir = getDirectory(currentAccount, type = MEDIA_DIR_IMAGE);
                 }
                 documentId = videoSize.location.volume_id;
                 dcId = videoSize.location.dc_id + (videoSize.location.local_id << 16);
             } else if (attach instanceof TLRPC.FileLocation) {
                 TLRPC.FileLocation fileLocation = (TLRPC.FileLocation) attach;
                 if (fileLocation.key != null || fileLocation.volume_id == Integer.MIN_VALUE && fileLocation.local_id < 0) {
-                    dir = getDirectory(MEDIA_DIR_CACHE);
+                    dir = getDirectory(currentAccount, MEDIA_DIR_CACHE);
                 } else {
                     documentId = fileLocation.volume_id;
                     dcId = fileLocation.dc_id + (fileLocation.local_id << 16);
-                    dir = getDirectory(type = MEDIA_DIR_IMAGE);
+                    dir = getDirectory(currentAccount, type = MEDIA_DIR_IMAGE);
                 }
             } else if (attach instanceof TLRPC.UserProfilePhoto || attach instanceof TLRPC.ChatPhoto) {
                 if (size == null) {
                     size = "s";
                 }
                 if ("s".equals(size)) {
-                    dir = getDirectory(MEDIA_DIR_CACHE);
+                    dir = getDirectory(currentAccount, MEDIA_DIR_CACHE);
                 } else {
-                    dir = getDirectory(MEDIA_DIR_IMAGE);
+                    dir = getDirectory(currentAccount, MEDIA_DIR_IMAGE);
                 }
             } else if (attach instanceof WebFile) {
                 WebFile document = (WebFile) attach;
                 if (document.mime_type.startsWith("image/")) {
-                    dir = getDirectory(MEDIA_DIR_IMAGE);
+                    dir = getDirectory(currentAccount, MEDIA_DIR_IMAGE);
                 } else if (document.mime_type.startsWith("audio/")) {
-                    dir = getDirectory(MEDIA_DIR_AUDIO);
+                    dir = getDirectory(currentAccount, MEDIA_DIR_AUDIO);
                 } else if (document.mime_type.startsWith("video/")) {
-                    dir = getDirectory(MEDIA_DIR_VIDEO);
+                    dir = getDirectory(currentAccount, MEDIA_DIR_VIDEO);
                 } else {
-                    dir = getDirectory(MEDIA_DIR_DOCUMENT);
+                    dir = getDirectory(currentAccount, MEDIA_DIR_DOCUMENT);
                 }
             } else if (attach instanceof TLRPC.TL_secureFile || attach instanceof SecureDocument) {
-                dir = getDirectory(MEDIA_DIR_CACHE);
+                dir = getDirectory(currentAccount, MEDIA_DIR_CACHE);
             }
         }
         if (dir == null) {
@@ -1521,7 +2028,10 @@ public class FileLoader extends BaseController {
         if (documentId != 0) {
             String path = filePathDatabase.getPath(documentId, dcId, type, useFileDatabaseQueue);
             if (path != null) {
-                return new File(path);
+                File resolved = resolveDatabasePathForRead(documentId, dcId, type, path);
+                if (resolved != null) {
+                    return resolved;
+                }
             }
         }
         return new File(dir, getAttachFileName(attach, ext));
@@ -1827,7 +2337,7 @@ public class FileLoader extends BaseController {
                         FileLog.e(e);
                     }
                     try {
-                        File key = new File(FileLoader.getInternalCacheDir(), file.getName() + ".enc.key");
+                        File key = new File(encrypted.getParentFile(), encrypted.getName() + ".key");
                         AgramDeletedMediaStore.deleteOrDefer(key);
                     } catch (Exception e) {
                         FileLog.e(e);

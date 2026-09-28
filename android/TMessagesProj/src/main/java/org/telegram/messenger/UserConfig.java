@@ -24,7 +24,7 @@ import java.util.Arrays;
 
 public class UserConfig extends BaseController {
 
-    public static int selectedAccount;
+    public static volatile int selectedAccount;
     public static final int ACCOUNT_STATE_EMPTY = 0;
     public static final int ACCOUNT_STATE_ACTIVE = 1;
     public static final int ACCOUNT_STATE_FROZEN = 2;
@@ -44,6 +44,10 @@ public class UserConfig extends BaseController {
     public final static int MAX_ACCOUNT_COUNT = 32;
 
     private final Object sync = new Object();
+    private final AgramSessionLifecycle sessionLifecycle = new AgramSessionLifecycle();
+    private static final String CONTACTS_CHOICE = "agram_contacts_choice_v1";
+    private boolean contactSyncChoiceMade;
+    private long contactSyncGeneration;
     private volatile boolean configLoaded;
     private TLRPC.User currentUser;
     private TLRPC.User retainedUser;
@@ -77,7 +81,7 @@ public class UserConfig extends BaseController {
 
     public boolean notificationsSettingsLoaded;
     public boolean notificationsSignUpSettingsLoaded;
-    public boolean syncContacts = true;
+    public volatile boolean syncContacts;
     public boolean suggestContacts = true;
     public boolean showCallsTab;
     public boolean hasSecureData;
@@ -140,7 +144,8 @@ public class UserConfig extends BaseController {
         int empty = -1;
         for (int a = MAX_ACCOUNT_COUNT - 1; a >= 0; a--) {
             UserConfig config = getInstance(a);
-            if (!config.isClientActivated()) {
+            if (!config.isClientActivated() && !config.hasPersistedSession()
+                    && AgramContainerManager.getInstance().canUseForNewLogin(a)) {
                 empty = a;
             }
         }
@@ -152,15 +157,20 @@ public class UserConfig extends BaseController {
      * Persist it synchronously in a dedicated registry so clearing account 0
      * or killing the process for an APK update cannot roll the pointer back.
      */
-    public static void setSelectedAccountPersisted(int account) {
+    public static boolean setSelectedAccountPersisted(int account) {
         if (account < 0 || account >= MAX_ACCOUNT_COUNT) {
             throw new IllegalArgumentException("Invalid account slot " + account);
         }
         synchronized (UserConfig.class) {
-            selectedAccount = account;
-            getAccountSelectionPreferences().edit()
+            boolean committed = getAccountSelectionPreferences().edit()
                     .putInt(SELECTED_ACCOUNT_KEY, account)
                     .commit();
+            if (!committed) {
+                FileLog.e("Unable to persist selected Agram account " + account);
+                return false;
+            }
+            selectedAccount = account;
+            return true;
         }
     }
 
@@ -168,18 +178,24 @@ public class UserConfig extends BaseController {
     public static int reconcileSelectedAccount() {
         int account = selectedAccount;
         if (account >= 0 && account < MAX_ACCOUNT_COUNT && getInstance(account).isClientActivated()) {
-            setSelectedAccountPersisted(account);
-            return account;
+            return persistReconciledAccount(account);
         }
         for (int a = 0; a < MAX_ACCOUNT_COUNT; a++) {
             if (getInstance(a).isClientActivated()) {
-                setSelectedAccountPersisted(a);
-                return a;
+                return persistReconciledAccount(a);
             }
         }
         account = getLoginTargetAccount();
-        setSelectedAccountPersisted(account);
-        return account;
+        return persistReconciledAccount(account);
+    }
+
+    private static int persistReconciledAccount(int account) {
+        if (setSelectedAccountPersisted(account)) {
+            return account;
+        }
+        // Do not report an unsaved selection as active. Keep the last durable
+        // in-memory pointer and let the next resume/startup retry reconciliation.
+        return selectedAccount >= 0 && selectedAccount < MAX_ACCOUNT_COUNT ? selectedAccount : 0;
     }
 
     /** Returns the canonical lowest free slot for an explicit new login. */
@@ -222,11 +238,15 @@ public class UserConfig extends BaseController {
     }
 
     public void saveConfig(boolean withFile) {
-        NotificationCenter.getInstance(currentAccount).doOnIdle(() -> {
+        final long expectedGeneration = getSessionGeneration();
+        Runnable save = () -> {
             if (!configLoaded) {
                 return;
             }
             synchronized (sync) {
+                if (!sessionLifecycle.isCurrent(expectedGeneration)) {
+                    return;
+                }
                 try {
                     SharedPreferences.Editor editor = getPreferences().edit();
                     editor.putBoolean("registeredForPush", registeredForPush);
@@ -243,7 +263,7 @@ public class UserConfig extends BaseController {
                     editor.putInt("webappRatingLoadTime", webappRatingLoadTime);
                     editor.putBoolean("contactsReimported", contactsReimported);
                     editor.putInt("loginTime", loginTime);
-                    editor.putBoolean("syncContacts", syncContacts);
+                    editor.putBoolean("syncContacts", AgramSessionLifecycle.contactSyncAllowed(contactSyncChoiceMade, syncContacts));
                     editor.putBoolean("showCallsTab", showCallsTab);
                     editor.putBoolean("suggestContacts", suggestContacts);
                     editor.putBoolean("hasSecureData", hasSecureData);
@@ -302,16 +322,154 @@ public class UserConfig extends BaseController {
                             editor.putString("user", string);
                             data.cleanup();
                         }
-                    } else {
-                        editor.remove("user");
                     }
 
-                    editor.apply();
+                    // Only confirmed clearConfig() may erase a persisted identity. A temporarily
+                    // missing runtime user must not turn an ordinary settings save into logout.
+                    if (!AgramPreferenceTransaction.commit(getPreferences(), editor, "user")) {
+                        FileLog.e("Unable to durably save account config " + currentAccount);
+                        NotificationCenter.getInstance(currentAccount).postNotificationName(
+                                NotificationCenter.agramContainerPersistenceFailed, currentAccount, "account_save");
+                    }
                 } catch (Exception e) {
                     FileLog.e(e);
                 }
             }
-        });
+        };
+        if (withFile) {
+            save.run();
+        } else {
+            NotificationCenter.getInstance(currentAccount).doOnIdle(save);
+        }
+    }
+
+    public long getSessionGeneration() {
+        return sessionLifecycle.generation();
+    }
+
+    public boolean isSessionGenerationCurrent(long generation) {
+        return sessionLifecycle.isCurrent(generation);
+    }
+
+    public boolean hasPersistedSession() {
+        return getPreferences().contains("user");
+    }
+
+    public boolean isContactSyncAllowed() {
+        synchronized (sync) {
+            return currentUser != null
+                    && AgramSessionLifecycle.contactSyncAllowed(contactSyncChoiceMade, syncContacts);
+        }
+    }
+
+    public long getContactSyncGeneration() {
+        synchronized (sync) {
+            return contactSyncGeneration;
+        }
+    }
+
+    public void runIfContactSyncAllowed(long generation, long consentGeneration, Runnable action) {
+        synchronized (sync) {
+            if (sessionLifecycle.isCurrent(generation) && contactSyncGeneration == consentGeneration
+                    && isContactSyncAllowed()) {
+                action.run();
+            }
+        }
+    }
+
+    /** Local opt-in only. Disabling never deletes contacts from Telegram. */
+    public boolean setContactSyncEnabled(boolean enabled) {
+        return setContactSyncEnabled(enabled, getSessionGeneration());
+    }
+
+    public boolean setContactSyncEnabled(boolean enabled, long expectedGeneration) {
+        synchronized (sync) {
+            if (!sessionLifecycle.isCurrent(expectedGeneration)) {
+                return false;
+            }
+            try {
+                SharedPreferences preferences = getPreferences();
+                if (!AgramPreferenceTransaction.commit(preferences, preferences.edit()
+                        .putBoolean(CONTACTS_CHOICE, true).putBoolean("syncContacts", enabled),
+                        CONTACTS_CHOICE, "syncContacts")) {
+                    notifyContactSyncPersistenceFailure();
+                    return false;
+                }
+            } catch (RuntimeException error) {
+                FileLog.e("Unable to persist account contact sync preference");
+                notifyContactSyncPersistenceFailure();
+                return false;
+            }
+            contactSyncChoiceMade = true;
+            syncContacts = enabled;
+            contactSyncGeneration++;
+            return true;
+        }
+    }
+
+    private void notifyContactSyncPersistenceFailure() {
+        AndroidUtilities.runOnUIThread(() -> NotificationCenter.getInstance(currentAccount).postNotificationName(
+                NotificationCenter.agramContainerPersistenceFailed, currentAccount, "contact_sync"));
+    }
+
+    /** Persist only for the container and session originally displayed by the settings screen. */
+    boolean setKeepDeletedMessagesEnabled(boolean enabled, String expectedContainerId, long expectedGeneration) {
+        final boolean[] committed = {false};
+        try {
+            AgramContainerManager manager = AgramContainerManager.getInstance();
+            manager.runBoundSettingsUpdate(currentAccount, expectedContainerId, () -> {
+                // Lock only the generation monitor. UserConfig.sync may already be held by
+                // contact work entering the container manager in the opposite direction.
+                synchronized (sessionLifecycle) {
+                    if (!sessionLifecycle.isCurrent(expectedGeneration)) {
+                        return;
+                    }
+                    manager.updateKeepDeletedMessages(currentAccount, enabled);
+                    committed[0] = true;
+                }
+            });
+        } catch (RuntimeException error) {
+            FileLog.e("Unable to persist account deleted-message preference");
+        }
+        return committed[0];
+    }
+
+    /** Persist authorization before native/UI state changes, without clearing an old session. */
+    public boolean installAuthorizedUser(TLRPC.User user, boolean contactsEnabled, long expectedGeneration) {
+        synchronized (sync) {
+            if (user == null || !AgramSessionLifecycle.canInstallAuthorization(currentUser != null,
+                    hasPersistedSession(), expectedGeneration, sessionLifecycle.generation())) {
+                return false;
+            }
+            SerializedData data = new SerializedData();
+            try {
+                user.serializeToStream(data);
+                SharedPreferences preferences = getPreferences();
+                int authorizationTime = (int) (System.currentTimeMillis() / 1000);
+                // Account zero shares this file with SharedConfig's app lock.
+                // A new authorization owns only identity/consent/login fields.
+                if (!AgramPreferenceTransaction.commit(preferences, preferences.edit()
+                        .putString("user", Base64.encodeToString(data.toByteArray(), Base64.DEFAULT))
+                        .putBoolean(CONTACTS_CHOICE, true).putBoolean("syncContacts", contactsEnabled)
+                        .putInt("loginTime", authorizationTime),
+                        "user", CONTACTS_CHOICE, "syncContacts", "loginTime")) {
+                    return false;
+                }
+                sessionLifecycle.advance();
+                contactSyncGeneration++;
+                contactSyncChoiceMade = true;
+                syncContacts = contactsEnabled;
+                loginTime = authorizationTime;
+                configLoaded = true;
+                setCurrentUser(user);
+                return true;
+            } catch (Exception e) {
+                FileLog.e("Unable to save authorized account", e);
+                return false;
+            } finally {
+                data.cleanup();
+            }
+        }
     }
 
     public static boolean isValidAccount(int num) {
@@ -383,27 +541,32 @@ public class UserConfig extends BaseController {
         }
     }
 
-    public void clearRetainedAccountState() {
+    public boolean clearRetainedAccountState() {
         synchronized (sync) {
-            clearRetainedAccountStateLocked();
+            return clearRetainedAccountStateLocked();
         }
     }
 
-    private void clearRetainedAccountStateLocked() {
+    private boolean clearRetainedAccountStateLocked() {
         SharedPreferences preferences = getAccountStatePreferences();
         if (retainedUser == null
                 && retainedAccountState == ACCOUNT_STATE_EMPTY
                 && !preferences.contains("state_" + currentAccount)
                 && !preferences.contains("user_" + currentAccount)) {
-            return;
+            return true;
         }
-        retainedUser = null;
-        retainedAccountState = ACCOUNT_STATE_EMPTY;
-        preferences.edit()
+        boolean committed = preferences.edit()
                 .remove("state_" + currentAccount)
                 .remove("user_" + currentAccount)
                 .commit();
+        if (!committed) {
+            FileLog.e("Unable to clear retained Agram account state " + currentAccount);
+            return false;
+        }
+        retainedUser = null;
+        retainedAccountState = ACCOUNT_STATE_EMPTY;
         clearLocalAccountAvatarLocked();
+        return true;
     }
 
     private SharedPreferences getAccountStatePreferences() {
@@ -429,6 +592,10 @@ public class UserConfig extends BaseController {
             byte[] bytes = Base64.decode(encoded, Base64.DEFAULT);
             if (encrypted) {
                 AgramContainerManager.ContainerRecord container = AgramContainerManager.getInstance().ensureContainer(currentAccount);
+                if (!container.isStorageAccessible()) {
+                    FileLog.e("Retaining encrypted Agram account card while its local key is unavailable for account " + currentAccount);
+                    return;
+                }
                 bytes = AgramSecureStore.decrypt(
                         container.id,
                         bytes,
@@ -448,6 +615,10 @@ public class UserConfig extends BaseController {
             if (retainedUser != null && !encrypted) {
                 saveLocalAccountSnapshotLocked(retainedUser, retainedAccountState, true);
             }
+        } catch (AgramSecureStore.KeyUnavailableException | AgramContainerManager.ContainerPersistenceException e) {
+            // Keystore and persistence outages are recoverable. Keep the
+            // encrypted card untouched so a later cold start can retry it.
+            FileLog.e("Retaining encrypted Agram account card after a local storage failure", e);
         } catch (Exception e) {
             FileLog.e(e);
             clearRetainedAccountStateLocked();
@@ -463,6 +634,8 @@ public class UserConfig extends BaseController {
         if (user == null) {
             return;
         }
+        TLRPC.User previousUser = retainedUser;
+        int previousState = retainedAccountState;
         retainedUser = user;
         retainedAccountState = state;
         SerializedData data = null;
@@ -479,12 +652,16 @@ public class UserConfig extends BaseController {
                     .putInt("state_" + currentAccount, state)
                     .putString("user_" + currentAccount, ENCRYPTED_ACCOUNT_CARD_PREFIX
                             + Base64.encodeToString(encrypted, Base64.NO_WRAP));
-            if (synchronous) {
-                editor.commit();
-            } else {
-                editor.apply();
+            // This snapshot is an identity/recovery boundary. A best-effort
+            // apply must not make the in-memory card look durably saved.
+            if (!editor.commit()) {
+                retainedUser = previousUser;
+                retainedAccountState = previousState;
+                FileLog.e("Unable to persist retained Agram account state " + currentAccount);
             }
         } catch (Exception e) {
+            retainedUser = previousUser;
+            retainedAccountState = previousState;
             FileLog.e(e);
         } finally {
             if (data != null) {
@@ -588,7 +765,11 @@ public class UserConfig extends BaseController {
             botGuestRatingLoadTime = preferences.getInt("botGuestRatingLoadTime", 0);
             webappRatingLoadTime = preferences.getInt("webappRatingLoadTime", 0);
             loginTime = preferences.getInt("loginTime", currentAccount);
-            syncContacts = preferences.getBoolean("syncContacts", true);
+            // Legacy true was a default, not evidence of consent. Keep existing remote
+            // contacts, but require a separate choice before reading/uploading this phonebook.
+            contactSyncChoiceMade = preferences.getBoolean(CONTACTS_CHOICE, false);
+            syncContacts = AgramSessionLifecycle.contactSyncAllowed(contactSyncChoiceMade,
+                    preferences.getBoolean("syncContacts", false));
             showCallsTab = preferences.getBoolean("showCallsTab", false);
             suggestContacts = preferences.getBoolean("suggestContacts", true);
             hasSecureData = preferences.getBoolean("hasSecureData", false);
@@ -640,21 +821,30 @@ public class UserConfig extends BaseController {
             }
 
             string = preferences.getString("user", null);
-            if (string != null) {
-                byte[] bytes = Base64.decode(string, Base64.DEFAULT);
-                if (bytes != null) {
-                    SerializedData data = new SerializedData(bytes);
-                    currentUser = TLRPC.User.TLdeserialize(data, data.readInt32(false), false);
-                    data.cleanup();
+            try {
+                if (string != null) {
+                    byte[] bytes = Base64.decode(string, Base64.DEFAULT);
+                    if (bytes != null) {
+                        SerializedData data = new SerializedData(bytes);
+                        try {
+                            currentUser = TLRPC.User.TLdeserialize(data, data.readInt32(false), false);
+                        } finally {
+                            data.cleanup();
+                        }
+                    }
                 }
+            } catch (Exception e) {
+                // Preserve the persisted user/native session and reserve its slot for recovery.
+                // A parsing/local-storage failure is not a Telegram logout confirmation.
+                FileLog.e("Unable to restore account identity; persisted session retained", e);
             }
             if (currentUser != null) {
                 checkPremiumSelf(null, currentUser);
                 clientUserId = currentUser.id;
             }
-            // Migrate away from the old retained-account-card feature. A
-            // revoked session is now removed and its slot becomes reusable.
-            clearRetainedAccountStateLocked();
+            if (currentUser != null) {
+                clearRetainedAccountStateLocked();
+            }
             configLoaded = true;
         }
     }
@@ -738,17 +928,45 @@ public class UserConfig extends BaseController {
         }
     }
 
-    public void clearConfig() {
-        clearConfig(false);
+    public boolean clearConfig() {
+        return clearConfig(false);
     }
 
-    public void clearConfig(boolean preserveBlockedAccount) {
-        clearRetainedAccountState();
-        getPreferences().edit().clear().apply();
+    public boolean clearConfig(boolean preserveBlockedAccount) {
+        return clearConfig(preserveBlockedAccount, getSessionGeneration());
+    }
+
+    public boolean clearConfig(boolean preserveBlockedAccount, long expectedGeneration) {
+        synchronized (sync) {
+        if (!sessionLifecycle.isCurrent(expectedGeneration)) {
+            return false;
+        }
+        try {
+            // Clear the small cross-session identity card first. If that fails,
+            // leave the primary account preferences and runtime session untouched.
+            if (!clearRetainedAccountState()) {
+                return false;
+            }
+            SharedPreferences accountPreferences = getPreferences();
+            String[] accountKeys = AgramAccountPreferenceKeys.removalKeys(accountPreferences.getAll().keySet());
+            SharedPreferences.Editor accountCleanup = accountPreferences.edit();
+            for (String key : accountKeys) accountCleanup.remove(key);
+            if (!AgramPreferenceTransaction.commit(accountPreferences, accountCleanup, accountKeys)) {
+                FileLog.e("Unable to durably clear account config " + currentAccount);
+                return false;
+            }
+        } catch (RuntimeException error) {
+            FileLog.e("Unable to durably clear account config " + currentAccount);
+            return false;
+        }
+        sessionLifecycle.advance();
+        contactSyncGeneration++;
+        contactSyncChoiceMade = false;
 
         sharingMyLocationUntil = 0;
         lastMyLocationShareTime = 0;
         currentUser = null;
+        tmpPassword = null;
         clientUserId = 0;
         registeredForPush = false;
         contactsSavedCount = 0;
@@ -768,7 +986,7 @@ public class UserConfig extends BaseController {
         webappRatingLoadTime = 0;
         draftsLoaded = false;
         contactsReimported = true;
-        syncContacts = true;
+        syncContacts = false;
         showCallsTab = false;
         suggestContacts = true;
         unreadDialogsLoaded = true;
@@ -780,9 +998,18 @@ public class UserConfig extends BaseController {
         lastContactsSyncTime = (int) (System.currentTimeMillis() / 1000) - 23 * 60 * 60;
         lastHintsSyncTime = (int) (System.currentTimeMillis() / 1000) - 25 * 60 * 60;
         resetSavedPassword();
+        }
         boolean hasActivated = false;
         for (int a = 0; a < MAX_ACCOUNT_COUNT; a++) {
-            if (getInstance(a).isClientActivated()) {
+            try {
+                UserConfig other = getInstance(a);
+                if (other.isClientActivated() || other.hasPersistedSession()) {
+                    hasActivated = true;
+                    break;
+                }
+            } catch (RuntimeException unavailablePreferences) {
+                // Unknown/unloaded is not proof that no other session exists.
+                // Preserve the application lock and shared settings on failure.
                 hasActivated = true;
                 break;
             }
@@ -791,6 +1018,7 @@ public class UserConfig extends BaseController {
             SharedConfig.clearConfig();
         }
         saveConfig(true);
+        return true;
     }
 
     public boolean isPinnedDialogsLoaded(int folderId) {

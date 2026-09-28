@@ -4,6 +4,7 @@
 package org.telegram.messenger;
 
 import android.os.SystemClock;
+import android.os.StatFs;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
@@ -23,6 +24,8 @@ import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -31,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 /**
  * App-private, per-container archive for media belonging to ordinary messages
@@ -39,6 +43,12 @@ import java.util.UUID;
  * cache or FilePathDatabase cannot remove or orphan it.
  */
 public final class AgramDeletedMediaStore {
+
+    public static final String STATE_IDLE = "idle";
+    public static final String STATE_SCANNING = "scanning";
+    public static final String STATE_READY = "ready";
+    public static final String STATE_ERROR = "error";
+    public static final String STATE_BLOCKED_LOW_SPACE = "blocked_low_space";
 
     private static final String ARCHIVE_DIRECTORY = "deleted_media/v1";
     private static final String JOURNAL_DIRECTORY = "deleted_media/pending_v1";
@@ -52,6 +62,10 @@ public final class AgramDeletedMediaStore {
     private static final int ORPHAN_RECONCILE_BATCH_SIZE = 64;
     private static final int RECONCILE_RETRY_DELAY_MS = 30_000;
     private static final long PENDING_TTL_MS = 6L * 60L * 60L * 1000L;
+    private static final long MIN_FREE_SPACE_RESERVE = 64L * 1024L * 1024L;
+    private static final long MAX_FREE_SPACE_RESERVE = 512L * 1024L * 1024L;
+    private static final long MIN_ARCHIVE_BUDGET = 512L * 1024L * 1024L;
+    private static final long MAX_ARCHIVE_BUDGET = 8L * 1024L * 1024L * 1024L;
     private static final DispatchQueue archiveQueue = new DispatchQueue("agramDeletedMediaArchive");
     private static final Object pendingLock = new Object();
     private static final Object archiveIoLock = new Object();
@@ -59,11 +73,87 @@ public final class AgramDeletedMediaStore {
     private static final Set<String> pendingSources = new HashSet<>();
     private static final Set<String> cleanedArchiveRoots = new HashSet<>();
     private static final Set<String> loadedJournalRoots = new HashSet<>();
+    private static final Set<String> loadingJournalRoots = new HashSet<>();
+    private static final Set<String> maintenanceScheduledRoots = new HashSet<>();
     private static final Set<String> invalidatedContainers = new HashSet<>();
     private static final Set<String> purgedMessageGuards = new LinkedHashSet<>();
     private static final Set<String> reconciledArchiveRoots = new HashSet<>();
+    private static final Map<String, ArchiveFailure> archiveFailures = new HashMap<>();
+    private static final Map<String, ArchiveUsage> archiveUsage = new HashMap<>();
 
     private AgramDeletedMediaStore() {
+    }
+
+    /** Runs all filesystem work on the archive queue and invokes {@code callback} once on UI. */
+    public static void requestStatus(int account, Consumer<ArchiveStatus> callback) {
+        if (callback == null) {
+            return;
+        }
+        ContainerSnapshot snapshot = captureContainer(account);
+        if (snapshot == null) {
+            postStatus(callback, new ArchiveStatus(STATE_ERROR, 0, 0, 0, 0,
+                    "Хранилище контейнера недоступно", getFreeBytes(null)));
+            return;
+        }
+        archiveQueue.postRunnable(() -> {
+            ArchiveUsage usage = scanArchiveUsage(snapshot);
+            int pending = 0;
+            int failed = 0;
+            ArchiveFailure failure;
+            synchronized (pendingLock) {
+                for (PendingEntry entry : pendingMessages.values()) {
+                    if (matches(entry, snapshot)) {
+                        pending++;
+                        if (entry.failureCount > 0 || entry.downloadFailed) {
+                            failed++;
+                        }
+                    }
+                }
+                failure = archiveFailures.get(containerIdentity(snapshot.account, snapshot.containerId));
+                if (usage.error == null) {
+                    archiveUsage.put(canonicalPath(snapshot.archiveRoot), usage);
+                }
+            }
+            String state = usage.error != null ? STATE_ERROR
+                    : failure == null ? STATE_READY : failure.state;
+            String error = usage.error != null ? usage.error
+                    : failure == null ? "" : failure.message;
+            postStatus(callback, new ArchiveStatus(state, usage.bytes, usage.files,
+                    pending, failed, error, getFreeBytes(snapshot.containerDirectory)));
+        });
+    }
+
+    /** Retries retained journals for one exact account/container; it never removes archives. */
+    public static void retryPending(int account) {
+        ContainerSnapshot snapshot = captureContainer(account);
+        if (snapshot == null) {
+            return;
+        }
+        archiveQueue.postRunnable(() -> {
+            ensureJournalLoaded(snapshot);
+            ArrayList<ArchiveRequest> retry = new ArrayList<>();
+            synchronized (pendingLock) {
+                archiveFailures.remove(containerIdentity(snapshot.account, snapshot.containerId));
+                for (PendingEntry entry : pendingMessages.values()) {
+                    if (!matches(entry, snapshot) || !entry.committed) {
+                        continue;
+                    }
+                    entry.failureCount = 0;
+                    entry.lastError = "";
+                    entry.sourceGeneration++;
+                    entry.lastAttemptedGeneration = 0;
+                    persistJournalLocked(entry);
+                    retry.add(entry.toRequest());
+                }
+            }
+            for (ArchiveRequest request : retry) {
+                enqueue(request);
+            }
+        });
+    }
+
+    private static void postStatus(Consumer<ArchiveStatus> callback, ArchiveStatus status) {
+        AndroidUtilities.runOnUIThread(() -> callback.accept(status));
     }
 
     /**
@@ -262,6 +352,8 @@ public final class AgramDeletedMediaStore {
 
     /** Removes all in-memory pins as part of explicit logout/container destruction. */
     public static void purgeContainer(int account, String containerId) {
+        final File scopedCacheDirectory = FileLoader.checkDirectory(
+                account, FileLoader.MEDIA_DIR_CACHE);
         synchronized (pendingLock) {
             if (!TextUtils.isEmpty(containerId)) {
                 invalidatedContainers.add(containerIdentity(account, containerId));
@@ -272,7 +364,11 @@ public final class AgramDeletedMediaStore {
                             "agram_containers" + File.separator + containerId);
                     cleanedArchiveRoots.remove(canonicalPath(new File(directory, ARCHIVE_DIRECTORY)));
                     loadedJournalRoots.remove(canonicalPath(new File(directory, JOURNAL_DIRECTORY)));
+                    loadingJournalRoots.remove(canonicalPath(new File(directory, JOURNAL_DIRECTORY)));
                     reconciledArchiveRoots.remove(canonicalPath(new File(directory, ARCHIVE_DIRECTORY)));
+                    maintenanceScheduledRoots.remove(containerIdentity(account, containerId));
+                    archiveFailures.remove(containerIdentity(account, containerId));
+                    archiveUsage.remove(canonicalPath(new File(directory, ARCHIVE_DIRECTORY)));
                 }
             }
             ArrayList<String> keys = new ArrayList<>();
@@ -282,6 +378,7 @@ public final class AgramDeletedMediaStore {
                     keys.add(entry.messageKey);
                     cleanedArchiveRoots.remove(canonicalPath(entry.snapshot.archiveRoot));
                     loadedJournalRoots.remove(canonicalPath(entry.snapshot.journalRoot));
+                    loadingJournalRoots.remove(canonicalPath(entry.snapshot.journalRoot));
                     reconciledArchiveRoots.remove(canonicalPath(entry.snapshot.archiveRoot));
                 }
             }
@@ -295,6 +392,14 @@ public final class AgramDeletedMediaStore {
         // cannot race a copy which recreates its old directory.
         synchronized (archiveIoLock) {
             // Barrier only.
+        }
+        FileLoader.onContainerPurged(account, containerId);
+        if (scopedCacheDirectory != null) {
+            archiveQueue.postRunnable(() -> {
+                synchronized (archiveIoLock) {
+                    deleteRecursively(scopedCacheDirectory);
+                }
+            });
         }
     }
 
@@ -818,7 +923,10 @@ public final class AgramDeletedMediaStore {
 
     /** Used by cache cleanup to close the copy-vs-delete race. */
     public static boolean isPendingSource(File file) {
-        ensureCurrentJournalsLoaded();
+        if (!ensureCurrentJournalsLoaded()) {
+            // Durable pins are not hydrated yet. Cache cleanup must fail closed.
+            return true;
+        }
         String path = canonicalPath(file);
         if (path == null) {
             return false;
@@ -860,12 +968,14 @@ public final class AgramDeletedMediaStore {
      * never perform a fallback delete after this method returns.
      */
     public static boolean deleteOrDefer(File file) {
-        ensureCurrentJournalsLoaded();
         String path = canonicalPath(file);
         if (path == null) {
             return false;
         }
         boolean managed = isManagedMediaPath(path);
+        if (managed && !ensureCurrentJournalsLoaded()) {
+            return true;
+        }
         synchronized (pendingLock) {
             prunePendingLocked();
             boolean pending = false;
@@ -896,10 +1006,21 @@ public final class AgramDeletedMediaStore {
         }
     }
 
-    private static void ensureCurrentJournalsLoaded() {
+    private static boolean ensureCurrentJournalsLoaded() {
+        boolean ready = true;
         for (int account = 0; account < UserConfig.MAX_ACCOUNT_COUNT; account++) {
-            captureContainer(account);
+            ContainerSnapshot snapshot = captureContainer(account);
+            if (snapshot == null) {
+                continue;
+            }
+            String journalRootPath = canonicalPath(snapshot.journalRoot);
+            synchronized (pendingLock) {
+                if (journalRootPath == null || !loadedJournalRoots.contains(journalRootPath)) {
+                    ready = false;
+                }
+            }
         }
+        return ready;
     }
 
     /** Rehydrates durable source pins and resumes them after a process restart. */
@@ -909,12 +1030,22 @@ public final class AgramDeletedMediaStore {
             return;
         }
         synchronized (pendingLock) {
-            if (isInvalidatedLocked(snapshot) || !loadedJournalRoots.add(journalRootPath)) {
+            if (isInvalidatedLocked(snapshot) || loadedJournalRoots.contains(journalRootPath)
+                    || !loadingJournalRoots.add(journalRootPath)) {
                 return;
             }
         }
         File[] files = snapshot.journalRoot.listFiles();
         if (files == null) {
+            if (!snapshot.journalRoot.exists()) {
+                finishJournalLoad(snapshot, journalRootPath);
+            } else {
+                synchronized (pendingLock) {
+                    loadingJournalRoots.remove(journalRootPath);
+                }
+                archiveQueue.postRunnable(() -> ensureJournalLoaded(snapshot),
+                        RECONCILE_RETRY_DELAY_MS);
+            }
             return;
         }
         ArrayList<ArchiveRequest> resumable = new ArrayList<>();
@@ -964,6 +1095,10 @@ public final class AgramDeletedMediaStore {
                     entry.committed |= loaded.committed;
                     entry.downloadFailed |= loaded.downloadFailed;
                     entry.downloadInFlight |= loaded.downloadInFlight;
+                    if (loaded.failureCount > entry.failureCount) {
+                        entry.failureCount = loaded.failureCount;
+                        entry.lastError = loaded.lastError;
+                    }
                     entry.lastTouchedWallTime = Math.max(entry.lastTouchedWallTime, loaded.lastTouchedWallTime);
                     entry.lastTouched = SystemClock.elapsedRealtime();
                 } else {
@@ -991,6 +1126,16 @@ public final class AgramDeletedMediaStore {
         }
         for (PendingReconcile reconcile : unresolved) {
             requestReconcile(reconcile);
+        }
+        finishJournalLoad(snapshot, journalRootPath);
+    }
+
+    private static void finishJournalLoad(ContainerSnapshot snapshot, String journalRootPath) {
+        synchronized (pendingLock) {
+            loadingJournalRoots.remove(journalRootPath);
+            if (!isInvalidatedLocked(snapshot)) {
+                loadedJournalRoots.add(journalRootPath);
+            }
         }
     }
 
@@ -1091,7 +1236,7 @@ public final class AgramDeletedMediaStore {
             }
             JSONObject json = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
             int version = json.optInt("version", 0);
-            if ((version != 1 && version != 2)
+            if ((version != 1 && version != 2 && version != 3)
                     || json.optInt("account", -1) != snapshot.account
                     || !TextUtils.equals(json.optString("container_id", ""), snapshot.containerId)) {
                 return null;
@@ -1151,6 +1296,8 @@ public final class AgramDeletedMediaStore {
             }
             entry.lastTouchedWallTime = json.optLong("touched_at", file.lastModified());
             entry.lastTouched = SystemClock.elapsedRealtime();
+            entry.failureCount = Math.max(0, json.optInt("failure_count", 0));
+            entry.lastError = json.optString("last_error", "");
             entry.readableSourceObserved = findReadableSource(request) != null;
             return entry;
         } catch (Throwable e) {
@@ -1180,7 +1327,7 @@ public final class AgramDeletedMediaStore {
                 ".agram-journal-part-" + UUID.randomUUID() + ".tmp");
         try {
             JSONObject json = new JSONObject();
-            json.put("version", 2);
+            json.put("version", 3);
             json.put("account", entry.snapshot.account);
             json.put("container_id", entry.snapshot.containerId);
             json.put("message_key", entry.messageKey);
@@ -1191,6 +1338,8 @@ public final class AgramDeletedMediaStore {
             json.put("committed", entry.committed);
             json.put("download_failed", entry.downloadFailed);
             json.put("download_in_flight", entry.downloadInFlight);
+            json.put("failure_count", entry.failureCount);
+            json.put("last_error", entry.lastError);
             json.put("touched_at", entry.lastTouchedWallTime);
             JSONArray sources = new JSONArray();
             int sourceCount = 0;
@@ -1311,14 +1460,33 @@ public final class AgramDeletedMediaStore {
                     containerDirectory,
                     new File(containerDirectory, ARCHIVE_DIRECTORY).getCanonicalFile(),
                     new File(containerDirectory, JOURNAL_DIRECTORY).getCanonicalFile());
-            cleanupStaleParts(snapshot.archiveRoot);
-            ensureJournalLoaded(snapshot);
-            ensureArchiveReconciliation(snapshot);
+            scheduleContainerMaintenance(snapshot);
             return snapshot;
         } catch (IOException e) {
             FileLog.e("Unable to resolve deleted-media archive directory", e);
             return null;
         }
+    }
+
+    private static void scheduleContainerMaintenance(ContainerSnapshot snapshot) {
+        String identity = snapshot == null ? null
+                : containerIdentity(snapshot.account, snapshot.containerId);
+        if (identity == null) {
+            return;
+        }
+        synchronized (pendingLock) {
+            if (isInvalidatedLocked(snapshot) || !maintenanceScheduledRoots.add(identity)) {
+                return;
+            }
+        }
+        archiveQueue.postRunnable(() -> {
+            if (!isCurrentContainer(snapshot)) {
+                return;
+            }
+            cleanupStaleParts(snapshot.archiveRoot);
+            ensureJournalLoaded(snapshot);
+            ensureArchiveReconciliation(snapshot);
+        });
     }
 
     private static ArchiveRequest createRequest(ContainerSnapshot snapshot, TLRPC.Message message, File preferredSource) {
@@ -1680,6 +1848,8 @@ public final class AgramDeletedMediaStore {
         }
         cleanupStaleParts(request.snapshot.archiveRoot);
         if (!parent.isDirectory() && !parent.mkdirs()) {
+            recordArchiveFailure(request, STATE_ERROR,
+                    "Не удалось создать каталог архива. Проверьте свободное место и повторите сохранение.");
             return;
         }
         if (!isCurrentContainer(request.snapshot)) {
@@ -1698,15 +1868,14 @@ public final class AgramDeletedMediaStore {
                 throw new IOException("Deleted-media source is incomplete: " + expectedLength
                         + " of " + request.expectedMediaSize + " bytes");
             }
-            long copied = 0;
-            byte[] buffer = new byte[COPY_BUFFER_SIZE];
+            if (!hasArchiveCapacity(request, expectedLength)) {
+                return;
+            }
+            long copied;
             try (FileInputStream input = new FileInputStream(source);
                  FileOutputStream output = new FileOutputStream(temporary)) {
-                int read;
-                while ((read = input.read(buffer)) != -1) {
-                    output.write(buffer, 0, read);
-                    copied += read;
-                }
+                copied = AgramArchiveCopy.copy(input, output, expectedLength,
+                        () -> isCurrentContainer(request.snapshot));
                 output.flush();
                 output.getFD().sync();
             }
@@ -1725,14 +1894,21 @@ public final class AgramDeletedMediaStore {
             }
             success = isCompleteArchive(request.destination, request.expectedMediaSize)
                     && syncDirectory(parent);
+            if (!success) {
+                recordArchiveFailure(request, STATE_ERROR,
+                        "Не удалось подтвердить сохранение архива на диск. Исходник защищён; повторите сохранение.");
+            }
         } catch (Throwable e) {
             FileLog.e("Unable to archive deleted-message media " + request.destination, e);
+            recordArchiveFailure(request, STATE_ERROR,
+                    "Не удалось сохранить медиа; нажмите «Повторить»");
         } finally {
             if (temporary.exists() && !temporary.delete()) {
                 FileLog.e("Unable to remove incomplete deleted-media archive " + temporary);
             }
         }
         if (success) {
+            clearArchiveFailure(request, request.destination.length());
             completePending(request.messageKey);
         }
     }
@@ -2035,23 +2211,7 @@ public final class AgramDeletedMediaStore {
     }
 
     private static boolean isManagedMediaPath(String path) {
-        if (TextUtils.isEmpty(path)) {
-            return false;
-        }
-        int[] types = {
-                FileLoader.MEDIA_DIR_IMAGE, FileLoader.MEDIA_DIR_AUDIO,
-                FileLoader.MEDIA_DIR_VIDEO, FileLoader.MEDIA_DIR_DOCUMENT,
-                FileLoader.MEDIA_DIR_CACHE, FileLoader.MEDIA_DIR_FILES,
-                FileLoader.MEDIA_DIR_STORIES, FileLoader.MEDIA_DIR_IMAGE_PUBLIC,
-                FileLoader.MEDIA_DIR_VIDEO_PUBLIC
-        };
-        for (int type : types) {
-            String root = canonicalPath(FileLoader.checkDirectory(type));
-            if (root != null && (path.equals(root) || path.startsWith(root + File.separator))) {
-                return true;
-            }
-        }
-        return false;
+        return FileLoader.isManagedMediaPath(path);
     }
 
     private static String safeLeafName(String value) {
@@ -2074,6 +2234,195 @@ public final class AgramDeletedMediaStore {
             safe.deleteCharAt(0);
         }
         return safe.toString();
+    }
+
+    private static ArchiveUsage scanArchiveUsage(ContainerSnapshot snapshot) {
+        ArchiveUsage result = new ArchiveUsage();
+        if (snapshot == null || !snapshot.archiveRoot.exists()) {
+            return result;
+        }
+        synchronized (archiveIoLock) {
+            String root = canonicalPath(snapshot.archiveRoot);
+            if (root == null) {
+                result.error = "Не удалось определить путь архива";
+                return result;
+            }
+            ArrayDeque<File> pending = new ArrayDeque<>();
+            pending.add(snapshot.archiveRoot);
+            while (!pending.isEmpty()) {
+                File directory = pending.removeFirst();
+                File[] children = directory.listFiles();
+                if (children == null) {
+                    if (directory.exists()) {
+                        result.error = "Не удалось прочитать размер архива";
+                    }
+                    return result;
+                }
+                for (File child : children) {
+                    if (child == null) {
+                        continue;
+                    }
+                    String childPath = canonicalPath(child);
+                    if (childPath == null || (!childPath.equals(root)
+                            && !childPath.startsWith(root + File.separator))) {
+                        continue;
+                    }
+                    if (child.isDirectory()) {
+                        pending.addLast(child);
+                    } else if (child.isFile() && !isArchiveTemporaryFile(child.getName())) {
+                        long length = Math.max(0, child.length());
+                        result.bytes = result.bytes > Long.MAX_VALUE - length
+                                ? Long.MAX_VALUE : result.bytes + length;
+                        result.files++;
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    private static long getFreeBytes(File path) {
+        File target = path;
+        if (target == null || !target.exists()) {
+            target = ApplicationLoader.applicationContext == null
+                    ? null : ApplicationLoader.applicationContext.getFilesDir();
+        }
+        if (target == null) {
+            return -1;
+        }
+        try {
+            return new StatFs(target.getAbsolutePath()).getAvailableBytes();
+        } catch (Throwable e) {
+            return -1;
+        }
+    }
+
+    private static long getTotalBytes(File path) {
+        File target = path;
+        if (target == null || !target.exists()) {
+            target = ApplicationLoader.applicationContext == null
+                    ? null : ApplicationLoader.applicationContext.getFilesDir();
+        }
+        if (target == null) {
+            return -1;
+        }
+        try {
+            return new StatFs(target.getAbsolutePath()).getTotalBytes();
+        } catch (Throwable e) {
+            return -1;
+        }
+    }
+
+    private static long archiveBudget(File path) {
+        long total = getTotalBytes(path);
+        if (total <= 0) {
+            return MAX_ARCHIVE_BUDGET;
+        }
+        return Math.max(MIN_ARCHIVE_BUDGET, Math.min(MAX_ARCHIVE_BUDGET, total / 4));
+    }
+
+    private static long freeSpaceReserve(File path) {
+        long total = getTotalBytes(path);
+        long adaptive = total <= 0 ? MIN_FREE_SPACE_RESERVE : total / 50;
+        return Math.max(MIN_FREE_SPACE_RESERVE,
+                Math.min(MAX_FREE_SPACE_RESERVE, adaptive));
+    }
+
+    private static boolean hasArchiveCapacity(ArchiveRequest request, long sourceLength) {
+        String root = canonicalPath(request.snapshot.archiveRoot);
+        ArchiveUsage usage;
+        synchronized (pendingLock) {
+            usage = archiveUsage.get(root);
+        }
+        if (usage == null || usage.error != null) {
+            usage = scanArchiveUsage(request.snapshot);
+            if (usage.error != null) {
+                recordArchiveFailure(request, STATE_ERROR, usage.error);
+                return false;
+            }
+            synchronized (pendingLock) {
+                archiveUsage.put(root, usage);
+            }
+        }
+        long budget = archiveBudget(request.snapshot.containerDirectory);
+        if (sourceLength > budget || usage.bytes > budget - sourceLength) {
+            recordArchiveFailure(request, STATE_ERROR,
+                    "Достигнут безопасный бюджет архива; выберите меньший объём");
+            return false;
+        }
+        long free = getFreeBytes(request.snapshot.containerDirectory);
+        long reserve = freeSpaceReserve(request.snapshot.containerDirectory);
+        if (free >= 0 && (sourceLength > Long.MAX_VALUE - reserve
+                || free < sourceLength + reserve)) {
+            recordArchiveFailure(request, STATE_BLOCKED_LOW_SPACE,
+                    "Недостаточно свободного места; освободите место и повторите");
+            return false;
+        }
+        return true;
+    }
+
+    private static void recordArchiveFailure(ArchiveRequest request, String state, String message) {
+        synchronized (pendingLock) {
+            PendingEntry entry = pendingMessages.get(request.messageKey);
+            if (matches(entry, request.snapshot)) {
+                entry.failureCount++;
+                entry.lastError = message == null ? "Не удалось сохранить медиа" : message;
+                persistJournalLocked(entry);
+            }
+            archiveFailures.put(containerIdentity(request.snapshot.account,
+                    request.snapshot.containerId), new ArchiveFailure(state,
+                    message == null ? "Не удалось сохранить медиа" : message));
+        }
+    }
+
+    private static void clearArchiveFailure(ArchiveRequest request, long archivedBytes) {
+        synchronized (pendingLock) {
+            archiveFailures.remove(containerIdentity(request.snapshot.account,
+                    request.snapshot.containerId));
+            ArchiveUsage usage = archiveUsage.get(canonicalPath(request.snapshot.archiveRoot));
+            if (usage != null && usage.error == null && archivedBytes > 0) {
+                usage.bytes = usage.bytes > Long.MAX_VALUE - archivedBytes
+                        ? Long.MAX_VALUE : usage.bytes + archivedBytes;
+                usage.files++;
+            }
+        }
+    }
+
+    public static final class ArchiveStatus {
+        public final String state;
+        public final long bytes;
+        public final long files;
+        public final int pending;
+        public final int failed;
+        public final String lastError;
+        public final long freeBytes;
+
+        public ArchiveStatus(String state, long bytes, long files, int pending, int failed,
+                             String lastError, long freeBytes) {
+            this.state = state;
+            this.bytes = bytes;
+            this.files = files;
+            this.pending = pending;
+            this.failed = failed;
+            this.lastError = lastError == null ? "" : lastError;
+            this.freeBytes = freeBytes;
+        }
+    }
+
+    private static final class ArchiveUsage {
+        long bytes;
+        long files;
+        String error;
+    }
+
+    private static final class ArchiveFailure {
+        final String state;
+        final String message;
+
+        ArchiveFailure(String state, String message) {
+            this.state = state;
+            this.message = message;
+        }
     }
 
     private static final class ContainerSnapshot {
@@ -2148,6 +2497,8 @@ public final class AgramDeletedMediaStore {
         long sourceGeneration = 1;
         long lastAttemptedGeneration;
         int activeJobs;
+        int failureCount;
+        String lastError = "";
 
         PendingEntry(ArchiveRequest request) {
             messageKey = request.messageKey;
